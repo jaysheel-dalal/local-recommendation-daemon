@@ -1,0 +1,9 @@
+build/
+compile_commands.json
+.cache/
+*.o
+*.a
+*.so
+core
+*.sock
+perf.data*

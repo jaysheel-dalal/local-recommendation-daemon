@@ -1,0 +1,86 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(lrd
+    VERSION 0.1.0
+    DESCRIPTION "Local Recommendation Daemon - on-device caching/ranking daemon with UDS IPC"
+    LANGUAGES CXX)
+
+# ---------------------------------------------------------------------------
+# Language level
+#
+# C++20, not 23: we want jthread / concepts / <span> / <bit>, all of which are
+# C++20. CXX_EXTENSIONS OFF means we compile as -std=c++20 rather than
+# -std=gnu++20, so a GNU-only extension fails at compile time here instead of
+# silently becoming a portability problem on a different toolchain.
+# ---------------------------------------------------------------------------
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Emit compile_commands.json for clangd / clang-tidy.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Put all binaries in one place so the bench script and the daemon can find
+# each other without preset-specific paths.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif()
+
+option(LRD_WERROR "Treat compiler warnings as errors" ON)
+option(LRD_BUILD_TESTS "Build unit tests" ON)
+option(LRD_BUILD_BENCH "Build the load-testing client" ON)
+set(LRD_SANITIZER "none" CACHE STRING "Sanitizer: none | thread | address | undefined")
+set_property(CACHE LRD_SANITIZER PROPERTY STRINGS none thread address undefined)
+
+# ---------------------------------------------------------------------------
+# lrd_options: an INTERFACE target carrying our warning flags and sanitizer
+# settings. Every target links it, so flags are declared once instead of being
+# smeared across add_compile_options() calls that leak into subdirectories.
+# ---------------------------------------------------------------------------
+add_library(lrd_options INTERFACE)
+
+target_compile_options(lrd_options INTERFACE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wshadow             # a shadowed variable in a lock scope is a real bug source
+    -Wconversion         # silent narrowing on the wire is how framing bugs start
+    -Wsign-conversion
+    -Wold-style-cast
+    -Wnon-virtual-dtor
+    -Wcast-align
+    $<$<BOOL:${LRD_WERROR}>:-Werror>)
+
+if(NOT LRD_SANITIZER STREQUAL "none")
+    # Sanitizers need the same flags at compile AND link time; an INTERFACE
+    # target that sets both is the least error-prone way to guarantee that.
+    target_compile_options(lrd_options INTERFACE
+        -fsanitize=${LRD_SANITIZER}
+        -fno-omit-frame-pointer
+        -g)
+    target_link_options(lrd_options INTERFACE -fsanitize=${LRD_SANITIZER})
+    message(STATUS "lrd: ${LRD_SANITIZER} sanitizer ENABLED")
+endif()
+
+# Threads::Threads resolves to -pthread. Using the imported target rather than
+# hardcoding -lpthread keeps this correct on toolchains where the flag differs.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
+add_subdirectory(src)
+
+if(LRD_BUILD_BENCH)
+    add_subdirectory(bench)
+endif()
+
+if(LRD_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
+message(STATUS "lrd ${PROJECT_VERSION} | ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} "
+               "| C++${CMAKE_CXX_STANDARD} | ${CMAKE_BUILD_TYPE} | sanitizer=${LRD_SANITIZER}")
