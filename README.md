@@ -27,8 +27,8 @@ milestone.
 | 3 | LRU cache | ✅ done |
 | 4 | Thread pool | ✅ done |
 | 5 | Concurrent server | ✅ done |
-| 6 | Benchmark client (throughput, p50/p90/p99) | ⏳ next |
-| 7 | Sharded cache + contention measurements | — |
+| 6 | Benchmark client (throughput, p50/p90/p99) | ✅ done |
+| 7 | Sharded cache + contention measurements | ⏳ next |
 
 Phase 2 (candidate ranking, exposure/frequency policy, client SDK, privacy
 noise) begins once step 7 lands.
@@ -82,6 +82,42 @@ cmake --preset debug && cmake --build --preset debug -j$(nproc)
 ./build/debug/bin/lrd_cli --socket /tmp/lrd.sock \
     --message "0123456789abcdefgh" --repeat 1000000
 ```
+
+---
+
+## Numbers
+
+Release build, WSL2 on 8 cores, median of 3 trials. Full tables, method and
+caveats in [`docs/benchmarks.md`](docs/benchmarks.md); reproduce with
+`scripts/bench.sh`.
+
+**End to end** (client → socket → daemon → locked cache), 90% reads, Zipf 0.99:
+
+| threads | ops/sec | p50 | p99 | p99.9 |
+|--------:|--------:|----:|----:|------:|
+| 1 | 9,615 | 94 µs | 223 µs | 311 µs |
+| 4 | 28,867 | 118 µs | 456 µs | 1.2 ms |
+| 16 | 143,293 | 46 µs | 629 µs | 3.7 ms |
+
+Single-threaded p50 is 94 µs against an **88 µs bare-IPC floor** on this host —
+framing, codec, cache and lock together cost ~6 µs. The daemon is not where the
+time goes; the syscalls are.
+
+**The same cache in-process**, no sockets in the way:
+
+| threads | ops/sec | p50 | p99 |
+|--------:|--------:|----:|----:|
+| 1 | 2,772,177 | 200 ns | 700 ns |
+| 8 | 618,791 | 1,600 ns | 160 µs |
+
+Throughput falls to **22% of single-threaded** and the p99 rises **230×** — a
+textbook mutex convoy.
+
+Both tables matter, and that is the finding: the lock is catastrophic in
+isolation and invisible end-to-end, because one IPC round trip is ~300× one
+uncontended cache operation. So the honest prediction for step 7 is that
+sharding will transform the second table and leave the first unchanged — and
+both results get reported.
 
 ---
 
@@ -172,6 +208,6 @@ src/             implementation, mirroring include/
   client/        client library — becomes the SDK in Phase 2
 bench/           load generator and latency reporter
 tests/           dependency-free harness + CTest entries
-docs/            protocol spec and concurrency write-up
+docs/            protocol spec, concurrency write-up, benchmark results
 scripts/         build and smoke helpers
 ```
