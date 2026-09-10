@@ -9,8 +9,14 @@ using proto::MessageType;
 using proto::Response;
 using proto::StatusCode;
 
+namespace {
+// Pure counters: nothing reads them to decide anything, so there is no
+// happens-before relationship to establish and no reason to pay for one.
+constexpr std::memory_order kCount = std::memory_order_relaxed;
+}  // namespace
+
 Response Handler::handle(const proto::Request& request) {
-    ++stats_.requests;
+    requests_.fetch_add(1, kCount);
 
     switch (request.type) {
         case MessageType::GetRequest:
@@ -33,32 +39,31 @@ Response Handler::handle(const proto::Request& request) {
 }
 
 Response Handler::handle_get(const proto::Request& request) {
-    ++stats_.gets;
+    gets_.fetch_add(1, kCount);
 
     Response response;
     response.type = MessageType::GetResponse;
     response.request_id = request.request_id;
 
-    // get() is not const: a hit reorders the recency list. That is the whole
-    // reason a shared_mutex cannot simply be dropped over this cache in step 5 -
-    // see docs/concurrency.md.
+    // The cache's mutex is taken and released entirely within this call.
     const auto value = cache_.get(request.key);
     if (!value) {
-        ++stats_.misses;
+        misses_.fetch_add(1, kCount);
         response.status = StatusCode::NotFound;
         return response;
     }
 
-    ++stats_.hits;
+    hits_.fetch_add(1, kCount);
     response.status = StatusCode::Ok;
-    // The shared_ptr keeps the value alive independently of the cache, so this
-    // copy could happen after a lock is released rather than while holding it.
+    // This copy happens with no lock held. That is precisely why the cache
+    // hands out a shared_ptr instead of the value: copying a 400 KB payload
+    // inside the critical section would stall every other worker behind it.
     response.value = *value;
     return response;
 }
 
 Response Handler::handle_put(const proto::Request& request) {
-    ++stats_.puts;
+    puts_.fetch_add(1, kCount);
 
     Response response;
     response.type = MessageType::PutResponse;
@@ -81,7 +86,7 @@ Response Handler::handle_put(const proto::Request& request) {
 }
 
 Response Handler::handle_delete(const proto::Request& request) {
-    ++stats_.deletes;
+    deletes_.fetch_add(1, kCount);
 
     Response response;
     response.type = MessageType::DeleteResponse;
@@ -90,18 +95,29 @@ Response Handler::handle_delete(const proto::Request& request) {
     return response;
 }
 
+proto::Stats Handler::stats() const {
+    proto::Stats stats;
+    stats.requests = requests_.load(kCount);
+    stats.gets = gets_.load(kCount);
+    stats.puts = puts_.load(kCount);
+    stats.deletes = deletes_.load(kCount);
+    stats.hits = hits_.load(kCount);
+    stats.misses = misses_.load(kCount);
+    // Cache-owned numbers are read at reporting time rather than mirrored into
+    // our counters on every operation: one source of truth, and no chance of
+    // the two drifting apart.
+    stats.evictions = cache_.metrics().evictions;
+    stats.entries = cache_.size();
+    stats.capacity = cache_.capacity();
+    return stats;
+}
+
 Response Handler::handle_stats(const proto::Request& request) const {
     Response response;
     response.type = MessageType::StatsResponse;
     response.request_id = request.request_id;
     response.status = StatusCode::Ok;
-    response.stats = stats_;
-    // Cache-owned numbers are read at reporting time rather than mirrored into
-    // stats_ on every operation: one source of truth, and no chance of the two
-    // drifting apart.
-    response.stats.evictions = cache_.metrics().evictions;
-    response.stats.entries = cache_.size();
-    response.stats.capacity = cache_.capacity();
+    response.stats = stats();
     return response;
 }
 

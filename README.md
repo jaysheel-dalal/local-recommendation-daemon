@@ -26,8 +26,8 @@ milestone.
 | 2 | Length-prefixed framing + binary codec | ✅ done |
 | 3 | LRU cache | ✅ done |
 | 4 | Thread pool | ✅ done |
-| 5 | Concurrent server | ⏳ next |
-| 6 | Benchmark client (throughput, p50/p90/p99) | — |
+| 5 | Concurrent server | ✅ done |
+| 6 | Benchmark client (throughput, p50/p90/p99) | ⏳ next |
 | 7 | Sharded cache + contention measurements | — |
 
 Phase 2 (candidate ranking, exposure/frequency policy, client SDK, privacy
@@ -57,9 +57,12 @@ the checked ones. `scripts/demo-kv.sh` runs the protocol end to end:
 put/get/delete/stats, a 400 KB value, a rejected oversized value, and 2000
 requests down one connection. `scripts/demo-cache.sh` demonstrates LRU
 eviction through the socket, including the case that distinguishes LRU from
-FIFO. `scripts/verify-tsan.sh` is the negative control for the sanitizer: it
-injects a deliberate data race and confirms ThreadSanitizer reports it, so that
-a clean TSan run is evidence rather than decoration. Everything compiles with `-Wall -Wextra -Wpedantic
+FIFO. `scripts/demo-concurrent.sh` runs eight
+clients at once against the threaded daemon and then stops it with SIGTERM,
+checking the socket file is cleaned up. `scripts/verify-tsan.sh` is the negative
+control for the sanitizer: it injects a deliberate data race and confirms
+ThreadSanitizer reports it, so that a clean TSan run is evidence rather than
+decoration. Everything compiles with `-Wall -Wextra -Wpedantic
 -Wconversion -Wshadow -Wold-style-cast -Werror`.
 
 Requires only a C++20 compiler, CMake ≥ 3.20 and pthreads. No third-party
@@ -139,10 +142,24 @@ move-only `Fd`) is not. C++23's `std::move_only_function` solves this properly;
 this build is C++20, verified, so `Task` is the ~40-line stand-in built from a
 concept/model type-erasure pair. Migration to C++23 would be a single `using`.
 
-**Blocking connection-per-task, not epoll, in Phase 1.** Simpler to reason
-about and to explain. Its real limitation — more concurrent connections than
-pool threads causes starvation — is a documented tradeoff, with the epoll
-migration sketched rather than pretended away.
+**Blocking connection-per-task, not epoll, in Phase 1.** A worker owns a
+connection until the peer disconnects. Simpler to reason about and to explain,
+with one sharp edge stated rather than discovered: **more concurrent connections
+than worker threads means the surplus get no service at all**, because the busy
+workers are blocked in `read()` on clients that may be idle. Fine for a handful
+of local clients on a device; not fine for many idle-ish connections. The fix is
+to dispatch *requests* rather than *connections* via epoll — a real
+restructuring, sketched in `Server`'s header rather than half-done.
+
+**Shutdown uses the self-pipe trick.** A signal arriving while the acceptor is
+blocked in `accept()` cannot be noticed by setting a flag — the thread is in the
+kernel. The handler writes one byte to a pipe the acceptor also polls, which is
+async-signal-safe. Workers blocked reading a quiet client are freed by
+`shutdown(fd, SHUT_RDWR)` from a registry of live connections — `shutdown`, not
+`close`, because closing a descriptor another thread is using is a use-after-free
+with extra steps. Result: SIGTERM exits cleanly and removes the socket file,
+instead of leaving the stale-socket debris that steps 1–4 relied on `bind()` to
+clean up afterwards.
 
 ---
 

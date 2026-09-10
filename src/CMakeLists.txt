@@ -49,7 +49,9 @@ target_link_libraries(lrd_client
 # worth testing without a socket in the way.
 # ---------------------------------------------------------------------------
 add_library(lrd_daemon STATIC
-    daemon/handler.cpp)
+    daemon/handler.cpp
+    daemon/connection_registry.cpp
+    daemon/server.cpp)
 
 target_link_libraries(lrd_daemon
     PUBLIC lrd_core

@@ -1,8 +1,8 @@
 # Concurrency and locking strategy
 
-Written as steps land. Steps 3-4 (this document's current scope) are the cache
-and the thread pool; step 5 adds the locking that connects them, and step 7
-shards the cache and measures the result.
+Written as steps land. Steps 3-5 (this document's current scope) are the cache,
+the thread pool, and the concurrent server that connects them. Step 6 measures
+the contention and step 7 shards the cache in response.
 
 ---
 
@@ -131,10 +131,9 @@ Deliberately left open until there are measurements to decide with:
 
 * Shard count for step 7 — to be chosen from the step 6 contention curve, not
   guessed.
-* Whether the thread pool queues connections or individual requests. Queueing
-  connections is simpler; it starves when concurrent connections outnumber
-  worker threads. Step 5 documents whichever it picks along with the failure
-  mode it accepts.
+
+Step 5 resolved the second open question: the pool queues **connections**, and
+the starvation that implies is documented on `Server` rather than hidden.
 
 ---
 
@@ -229,3 +228,108 @@ WARNING: ThreadSanitizer: data race (pid=41268)
 
 That is what makes the clean runs on the real suite evidence rather than
 decoration.
+
+---
+
+## The server's shutdown path (step 5)
+
+Three separate problems, three separate mechanisms. Each exists because the
+obvious approach does not work.
+
+### Waking an acceptor blocked in accept()
+
+Setting a `stop` flag does nothing: the thread is inside the kernel and will
+stay there until a client connects. So the acceptor does not call `accept()`
+directly - it `poll()`s two descriptors, the listening socket and the read end
+of a pipe, and only calls `accept()` when the listener is actually ready.
+
+Stopping means writing one byte to that pipe. This is the **self-pipe trick**,
+and its point is that a signal handler may only call async-signal-safe
+functions - which excludes essentially the whole standard library: no
+allocation, no locks, no `printf`, no `std::format`. `write()` is on the safe
+list. So the handler does exactly one thing:
+
+```cpp
+void handle_stop_signal(int) {
+    const int saved_errno = errno;
+    if (Server* s = g_signal_target.load(std::memory_order_relaxed)) {
+        s->request_stop();          // one write() to the pipe
+    }
+    errno = saved_errno;
+}
+```
+
+Saving and restoring `errno` matters. The handler interrupted a thread that may
+have been between a failing syscall and its check of `errno`; clobbering it
+would make that thread diagnose a completely unrelated failure.
+
+The file-scope pointer is a `std::atomic<Server*>` with a `static_assert` on
+`is_always_lock_free`. A signal handler may only touch a lock-free atomic - a
+lock-based one could deadlock against the very thread it interrupted.
+
+Linux has `signalfd`, which is tidier. The pipe is used instead because it works
+identically on macOS and the BSDs.
+
+### Waking a worker blocked reading a quiet client
+
+A worker serving a connection spends nearly all its time in `read()`, waiting
+for a request that may never come. No flag reaches it either. `ConnectionRegistry`
+holds the descriptor of every live connection, and shutdown calls
+`shutdown(fd, SHUT_RDWR)` on each - which makes that blocked `read()` return 0,
+exactly as if the client had hung up, a case the connection loop already
+handles.
+
+**`shutdown()`, not `close()`.** Closing a descriptor another thread is actively
+using is a use-after-free with extra steps: the number can be reissued by the
+kernel to an unrelated file the instant it is freed, and the blocked thread
+would then be reading someone else's socket. `shutdown()` breaks the connection
+while leaving the descriptor owned by its `Fd`, which closes it normally
+afterwards.
+
+The registry mutex is deliberately held across the `shutdown()` syscall, and
+connections deregister *before* their `Fd` closes. That is what guarantees
+`stop_all()` can never be looking at a number that has already been recycled.
+
+### The connection that has not started yet
+
+A connection can be popped off the pool's queue microseconds after `stop_all()`
+has already walked the list. The registry therefore latches closed: `add()`
+returns 0 once stopping has begun, and the worker abandons that connection
+immediately. Combined with `ShutdownPolicy::Discard`, whose dropped tasks
+destroy their captured `UnixStream`s and close those sockets, every connection
+is accounted for.
+
+### Order of operations
+
+```cpp
+listener_.close();      // 1. no new clients, socket file removed
+registry_.stop_all();   // 2. break live connections, latch the registry closed
+pool_.shutdown(Discard) // 3. drop queued connections, join workers
+```
+
+`Discard` rather than `Drain`: a queued task here is an unserved connection, not
+useful work, and running it would only mean greeting a client we are about to
+disconnect.
+
+## A bug worth recording
+
+The self-pipe was originally two members, `Fd stop_read_` and `Fd stop_write_`,
+initialised from a helper taking the write end by reference:
+
+```cpp
+stop_read_(make_pipe(stop_write_)),   // silently broken
+```
+
+This compiles cleanly and is wrong. **Members are initialised in declaration
+order, regardless of the order the constructor's init-list is written in.**
+`stop_read_` is declared first, so `make_pipe` filled in `stop_write_` before
+`stop_write_`'s own initialisation had run - and its default member initialiser
+then overwrote the descriptor with -1.
+
+The symptom was not a crash. Every write to the stop pipe failed silently, the
+acceptor never woke, and shutdown hung forever - which is how it was found: the
+server test suite timed out at 60 seconds with the first case never returning.
+
+The fix is structural rather than a reordering: both ends now live in one struct
+returned by value, so there is no second member to initialise out of order and
+the hazard cannot recur.
