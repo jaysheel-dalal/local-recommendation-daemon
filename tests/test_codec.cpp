@@ -1,10 +1,12 @@
 #include "lrd/proto/codec.hpp"
 
+#include "codec_conformance.hpp"
 #include "test_harness.hpp"
 
 #include <string>
 
 using namespace lrd::proto;
+namespace conformance = lrd::proto::conformance;
 
 namespace {
 
@@ -27,7 +29,19 @@ ByteBuffer make_body(std::uint32_t magic = kMagic, std::uint8_t version = kVersi
 
 }  // namespace
 
-LRD_TEST("get request round-trips") {
+// Round-trip semantics live in codec_conformance.hpp, so that ProtobufCodec is
+// held to exactly the same behaviour rather than to a suite written around the
+// binary format. What stays in this file is what is specific to binary/v1:
+// how *this* format detects corruption.
+
+LRD_TEST("binary codec satisfies the shared codec conformance suite") {
+    const BinaryCodec codec;
+    conformance::run_all(codec);
+}
+
+LRD_TEST("a get request is exactly the header plus a length-prefixed key") {
+    // Format-specific on purpose: it pins the byte layout documented in
+    // docs/protocol.md, which a round-trip test cannot.
     const BinaryCodec codec;
     Request original;
     original.type = MessageType::GetRequest;
@@ -36,35 +50,10 @@ LRD_TEST("get request round-trips") {
 
     ByteBuffer buffer;
     codec.encode(original, buffer);
-    // Header is 16 bytes; payload is a 4-byte length prefix plus the key.
     LRD_CHECK_EQ(buffer.size(), kHeaderSize + 4 + original.key.size());
-
-    Request decoded;
-    LRD_REQUIRE(codec.decode(buffer, decoded) == DecodeError::None);
-    LRD_CHECK(decoded.type == MessageType::GetRequest);
-    LRD_CHECK_EQ(decoded.request_id, std::uint64_t{42});
-    LRD_CHECK_EQ(decoded.key, original.key);
 }
 
-LRD_TEST("put request round-trips key and value") {
-    const BinaryCodec codec;
-    Request original;
-    original.type = MessageType::PutRequest;
-    original.request_id = 0xFFFFFFFFFFFFFFFFULL;  // exercises the full 64-bit id
-    original.key = "key";
-    original.value = std::string("binary\0value", 12);
-
-    ByteBuffer buffer;
-    codec.encode(original, buffer);
-
-    Request decoded;
-    LRD_REQUIRE(codec.decode(buffer, decoded) == DecodeError::None);
-    LRD_CHECK_EQ(decoded.request_id, original.request_id);
-    LRD_CHECK_EQ(decoded.key, original.key);
-    LRD_CHECK_EQ(decoded.value, original.value);
-}
-
-LRD_TEST("stats request has an empty payload") {
+LRD_TEST("a stats request is header-only") {
     const BinaryCodec codec;
     Request original;
     original.type = MessageType::StatsRequest;
@@ -73,70 +62,6 @@ LRD_TEST("stats request has an empty payload") {
     ByteBuffer buffer;
     codec.encode(original, buffer);
     LRD_CHECK_EQ(buffer.size(), kHeaderSize);
-
-    Request decoded;
-    LRD_CHECK(codec.decode(buffer, decoded) == DecodeError::None);
-    LRD_CHECK(decoded.type == MessageType::StatsRequest);
-}
-
-LRD_TEST("every response type round-trips") {
-    const BinaryCodec codec;
-
-    {
-        Response original;
-        original.type = MessageType::GetResponse;
-        original.request_id = 1;
-        original.status = StatusCode::Ok;
-        original.value = "cached";
-
-        ByteBuffer buffer;
-        codec.encode(original, buffer);
-        Response decoded;
-        LRD_REQUIRE(codec.decode(buffer, decoded) == DecodeError::None);
-        LRD_CHECK(decoded.status == StatusCode::Ok);
-        LRD_CHECK_EQ(decoded.value, std::string("cached"));
-    }
-    {
-        Response original;
-        original.type = MessageType::GetResponse;
-        original.status = StatusCode::NotFound;
-
-        ByteBuffer buffer;
-        codec.encode(original, buffer);
-        Response decoded;
-        LRD_REQUIRE(codec.decode(buffer, decoded) == DecodeError::None);
-        LRD_CHECK(decoded.status == StatusCode::NotFound);
-        LRD_CHECK(decoded.value.empty());
-    }
-    {
-        Response original;
-        original.type = MessageType::StatsResponse;
-        original.status = StatusCode::Ok;
-        original.stats = Stats{100, 60, 30, 10, 45, 15, 5, 20, 64};
-
-        ByteBuffer buffer;
-        codec.encode(original, buffer);
-        Response decoded;
-        LRD_REQUIRE(codec.decode(buffer, decoded) == DecodeError::None);
-        LRD_CHECK_EQ(decoded.stats.requests, std::uint64_t{100});
-        LRD_CHECK_EQ(decoded.stats.gets, std::uint64_t{60});
-        LRD_CHECK_EQ(decoded.stats.puts, std::uint64_t{30});
-        LRD_CHECK_EQ(decoded.stats.deletes, std::uint64_t{10});
-        LRD_CHECK_EQ(decoded.stats.hits, std::uint64_t{45});
-        LRD_CHECK_EQ(decoded.stats.misses, std::uint64_t{15});
-        LRD_CHECK_EQ(decoded.stats.evictions, std::uint64_t{5});
-        LRD_CHECK_EQ(decoded.stats.entries, std::uint64_t{20});
-        LRD_CHECK_EQ(decoded.stats.capacity, std::uint64_t{64});
-    }
-    {
-        const Response original = make_error(9, StatusCode::InvalidRequest, "key too long");
-        ByteBuffer buffer;
-        codec.encode(original, buffer);
-        Response decoded;
-        LRD_REQUIRE(codec.decode(buffer, decoded) == DecodeError::None);
-        LRD_CHECK(decoded.type == MessageType::ErrorResponse);
-        LRD_CHECK_EQ(decoded.value, std::string("key too long"));
-    }
 }
 
 // --------------------------------------------------------------------------

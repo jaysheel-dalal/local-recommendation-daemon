@@ -14,6 +14,12 @@ target_link_libraries(lrd_bench PRIVATE lrd_client lrd_core lrd_options)
 add_executable(lrd_cache_bench cache_bench.cpp)
 target_link_libraries(lrd_cache_bench PRIVATE lrd_core lrd_options)
 
+# lrd_codec_bench - encode/decode CPU cost and wire size, no sockets. The
+# end-to-end path cannot see a codec difference (IPC is ~1000x an encode), so
+# the comparison has to happen here. Same reasoning as lrd_cache_bench.
+add_executable(lrd_codec_bench codec_bench.cpp)
+target_link_libraries(lrd_codec_bench PRIVATE lrd_core lrd_options)
+
 # ---------------------------------------------------------------------------
 # Baseline probes.
 #
