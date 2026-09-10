@@ -7,8 +7,6 @@
 // Known limitations, both deliberate and both scheduled:
 //   * One connection at a time. The thread pool and concurrent server are
 //     steps 4-5.
-//   * The store is an unbounded std::unordered_map, not a cache. LRU eviction
-//     is step 3.
 //   * No graceful shutdown: Ctrl-C kills the process before ~UnixListener can
 //     unlink the socket file, which leaves the stale-socket case that
 //     UnixListener::bind cleans up on the next start. Step 5 adds a self-pipe.
@@ -22,6 +20,7 @@
 #include "lrd/proto/framing.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <string>
 #include <string_view>
@@ -30,8 +29,11 @@ namespace {
 
 constexpr std::string_view kDefaultSocketPath = "/tmp/lrd.sock";
 
+constexpr std::size_t kDefaultCapacity = 10000;
+
 struct Options {
     std::string socket_path{kDefaultSocketPath};
+    std::size_t capacity = kDefaultCapacity;
     bool verbose = false;
     bool show_help = false;
     bool show_version = false;
@@ -42,10 +44,12 @@ void print_usage(const char* argv0) {
         "usage: %s [options]\n"
         "\n"
         "  --socket PATH   unix domain socket to listen on (default: %.*s)\n"
+        "  --capacity N    cache entries before LRU eviction (default: %zu)\n"
         "  --verbose       log every request\n"
         "  --version       print version and exit\n"
         "  --help          print this message and exit\n",
-        argv0, static_cast<int>(kDefaultSocketPath.size()), kDefaultSocketPath.data());
+        argv0, static_cast<int>(kDefaultSocketPath.size()), kDefaultSocketPath.data(),
+        kDefaultCapacity);
 }
 
 bool parse_args(int argc, char** argv, Options& out) {
@@ -63,6 +67,16 @@ bool parse_args(int argc, char** argv, Options& out) {
                 return false;
             }
             out.socket_path = argv[++i];
+        } else if (arg == "--capacity") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "lrdd: --capacity requires a number\n");
+                return false;
+            }
+            out.capacity = std::strtoul(argv[++i], nullptr, 10);
+            if (out.capacity == 0) {
+                std::fprintf(stderr, "lrdd: --capacity must be at least 1\n");
+                return false;
+            }
         } else {
             std::fprintf(stderr, "lrdd: unknown argument '%.*s'\n", static_cast<int>(arg.size()),
                          arg.data());
@@ -166,9 +180,9 @@ int run(const Options& opts) {
     // One Handler for the whole daemon: the store must outlive individual
     // connections, or a PUT on one connection would be invisible to a GET on
     // the next.
-    lrd::daemon::Handler handler;
+    lrd::daemon::Handler handler(opts.capacity);
     const lrd::proto::BinaryCodec codec;
-    lrd::log_info("codec: {}", codec.name());
+    lrd::log_info("codec: {}, cache capacity: {}", codec.name(), opts.capacity);
 
     for (;;) {
         lrd::net::UnixStream stream = listener.accept();

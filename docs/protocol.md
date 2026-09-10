@@ -92,7 +92,16 @@ a wrongly-directed message before parsing the payload.
 
 ### `StatsResponse` fields
 
-In order: `requests`, `gets`, `puts`, `deletes`, `hits`, `misses`.
+In order: `requests`, `gets`, `puts`, `deletes`, `hits`, `misses`,
+`evictions`, `entries`, `capacity` — nine `uint64` values.
+
+The last three were appended in step 3. Appending fields is a **breaking**
+change under this protocol, because the decoder rejects trailing bytes: a step 2
+client talking to a step 3 daemon gets `TrailingBytes` rather than silently
+misreading the reply. That is the intended behaviour — version skew becomes a
+loud, immediate failure instead of plausible-looking wrong numbers. Nothing is
+deployed, so v1 was edited in place; a shipped protocol would have bumped
+`kVersion` instead.
 
 ## Field encodings
 

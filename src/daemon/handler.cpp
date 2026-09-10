@@ -39,8 +39,11 @@ Response Handler::handle_get(const proto::Request& request) {
     response.type = MessageType::GetResponse;
     response.request_id = request.request_id;
 
-    const auto it = store_.find(request.key);
-    if (it == store_.end()) {
+    // get() is not const: a hit reorders the recency list. That is the whole
+    // reason a shared_mutex cannot simply be dropped over this cache in step 5 -
+    // see docs/concurrency.md.
+    const auto value = cache_.get(request.key);
+    if (!value) {
         ++stats_.misses;
         response.status = StatusCode::NotFound;
         return response;
@@ -48,7 +51,9 @@ Response Handler::handle_get(const proto::Request& request) {
 
     ++stats_.hits;
     response.status = StatusCode::Ok;
-    response.value = it->second;
+    // The shared_ptr keeps the value alive independently of the cache, so this
+    // copy could happen after a lock is released rather than while holding it.
+    response.value = *value;
     return response;
 }
 
@@ -67,11 +72,10 @@ Response Handler::handle_put(const proto::Request& request) {
                                  "key must not be empty");
     }
 
-    // insert_or_assign rather than operator[] followed by assignment: it avoids
-    // default-constructing a std::string that is immediately overwritten, and
-    // it says at the call site that overwriting is intended rather than
-    // accidental.
-    store_.insert_or_assign(request.key, request.value);
+    // May evict the least-recently-used entry. A PUT that succeeds is therefore
+    // not a promise that a later GET will hit - the defining difference between
+    // a cache and a store, and something a client has to be written to expect.
+    cache_.put(request.key, request.value);
     response.status = StatusCode::Ok;
     return response;
 }
@@ -82,7 +86,7 @@ Response Handler::handle_delete(const proto::Request& request) {
     Response response;
     response.type = MessageType::DeleteResponse;
     response.request_id = request.request_id;
-    response.status = (store_.erase(request.key) > 0) ? StatusCode::Ok : StatusCode::NotFound;
+    response.status = cache_.erase(request.key) ? StatusCode::Ok : StatusCode::NotFound;
     return response;
 }
 
@@ -92,6 +96,12 @@ Response Handler::handle_stats(const proto::Request& request) const {
     response.request_id = request.request_id;
     response.status = StatusCode::Ok;
     response.stats = stats_;
+    // Cache-owned numbers are read at reporting time rather than mirrored into
+    // stats_ on every operation: one source of truth, and no chance of the two
+    // drifting apart.
+    response.stats.evictions = cache_.metrics().evictions;
+    response.stats.entries = cache_.size();
+    response.stats.capacity = cache_.capacity();
     return response;
 }
 

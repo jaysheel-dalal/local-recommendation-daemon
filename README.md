@@ -24,8 +24,8 @@ milestone.
 | 0 | Build system, presets, test harness | ✅ done |
 | 1 | RAII fd wrapper, UNIX socket transport, short-read-safe I/O | ✅ done |
 | 2 | Length-prefixed framing + binary codec | ✅ done |
-| 3 | LRU cache | ⏳ next |
-| 4 | Thread pool | — |
+| 3 | LRU cache | ✅ done |
+| 4 | Thread pool | ⏳ next |
 | 5 | Concurrent server | — |
 | 6 | Benchmark client (throughput, p50/p90/p99) | — |
 | 7 | Sharded cache + contention measurements | — |
@@ -53,9 +53,11 @@ Four presets are defined:
 | `asan` | AddressSanitizer |
 
 `scripts/build-all.sh` configures and builds all four and runs the suite under
-the checked ones. `scripts/demo-kv.sh` runs the step 2 milestone end to end:
+the checked ones. `scripts/demo-kv.sh` runs the protocol end to end:
 put/get/delete/stats, a 400 KB value, a rejected oversized value, and 2000
-requests down one connection. Everything compiles with `-Wall -Wextra -Wpedantic
+requests down one connection. `scripts/demo-cache.sh` demonstrates LRU
+eviction through the socket, including the case that distinguishes LRU from
+FIFO. Everything compiles with `-Wall -Wextra -Wpedantic
 -Wconversion -Wshadow -Wold-style-cast -Werror`.
 
 Requires only a C++20 compiler, CMake ≥ 3.20 and pthreads. No third-party
@@ -68,7 +70,7 @@ dependencies in Phase 1 — see *Wire format* below for why.
 ```bash
 cmake --preset debug && cmake --build --preset debug -j$(nproc)
 
-./build/debug/bin/lrdd --socket /tmp/lrd.sock &
+./build/debug/bin/lrdd --socket /tmp/lrd.sock --capacity 10000 &
 ./build/debug/bin/lrd_cli --socket /tmp/lrd.sock --message "hello"
 
 # 18 MB, split by the kernel across hundreds of reads and writes
@@ -93,12 +95,20 @@ the same benchmark.
 
 **A reader-writer lock is the wrong default for an LRU cache.** A cache hit
 moves its entry to most-recently-used, so `get()` mutates — taking a shared
-lock on the read path is a data race, not an optimisation. Phase 1 starts with
-a plain `std::mutex`, demonstrates the resulting contention in the benchmark
-(step 6), and then shards the cache to fix it (step 7). The alternative —
-keeping `shared_mutex` and switching to an approximate, non-mutating eviction
-policy such as CLOCK — is written up in `docs/concurrency.md` as the road not
-taken.
+lock on the read path is a data race, not an optimisation. `LruCache::get` is
+therefore deliberately non-`const`; the signature is the warning, and `peek()`
+sits beside it as the operation that genuinely is const. Phase 1 starts with a
+plain `std::mutex` (step 5), measures the resulting contention (step 6), then
+shards the cache (step 7). The alternatives — CLOCK, sampled eviction,
+sharding, lock-free — are each written up with their real costs in
+`docs/concurrency.md`.
+
+**Cache values are `shared_ptr<const Value>`.** A reference into the cache would
+dangle once the lock is released or the entry is evicted; returning by value
+copies the whole payload *while holding the lock*. A shared_ptr copies one
+refcounted pointer under the lock and keeps the value alive for as long as the
+caller holds it. The `const` means an update swaps in a new pointer rather than
+mutating one a reader is holding, so readers always see a coherent snapshot.
 
 **Stream sockets have no message boundaries, and the transport layer is built
 around that.** `read()` on a `SOCK_STREAM` socket returns whatever has arrived,

@@ -112,7 +112,7 @@ LRD_TEST("every response type round-trips") {
         Response original;
         original.type = MessageType::StatsResponse;
         original.status = StatusCode::Ok;
-        original.stats = Stats{100, 60, 30, 10, 45, 15};
+        original.stats = Stats{100, 60, 30, 10, 45, 15, 5, 20, 64};
 
         ByteBuffer buffer;
         codec.encode(original, buffer);
@@ -124,6 +124,9 @@ LRD_TEST("every response type round-trips") {
         LRD_CHECK_EQ(decoded.stats.deletes, std::uint64_t{10});
         LRD_CHECK_EQ(decoded.stats.hits, std::uint64_t{45});
         LRD_CHECK_EQ(decoded.stats.misses, std::uint64_t{15});
+        LRD_CHECK_EQ(decoded.stats.evictions, std::uint64_t{5});
+        LRD_CHECK_EQ(decoded.stats.entries, std::uint64_t{20});
+        LRD_CHECK_EQ(decoded.stats.capacity, std::uint64_t{64});
     }
     {
         const Response original = make_error(9, StatusCode::InvalidRequest, "key too long");

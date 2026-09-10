@@ -17,6 +17,7 @@
 #include "lrd/proto/message.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -100,13 +101,28 @@ int cmd_stats(Connection& connection) {
         return report(status, connection, "stats");
     }
 
-    std::printf("requests %llu\ngets     %llu\nputs     %llu\ndeletes  %llu\nhits     %llu\nmisses   %llu\n",
+    // Hit rate and occupancy are the two numbers that actually say whether a
+    // cache is sized correctly, and neither is on the wire - both are derived
+    // here from the raw counters.
+    const auto pct = [](std::uint64_t part, std::uint64_t whole) {
+        return whole == 0 ? 0.0
+                          : 100.0 * static_cast<double>(part) / static_cast<double>(whole);
+    };
+
+    std::printf("requests   %llu\ngets       %llu\nputs       %llu\ndeletes    %llu\n"
+                "hits       %llu\nmisses     %llu\nhit rate   %.1f%%\n"
+                "evictions  %llu\nentries    %llu / %llu (%.1f%% full)\n",
                 static_cast<unsigned long long>(stats.requests),
                 static_cast<unsigned long long>(stats.gets),
                 static_cast<unsigned long long>(stats.puts),
                 static_cast<unsigned long long>(stats.deletes),
                 static_cast<unsigned long long>(stats.hits),
-                static_cast<unsigned long long>(stats.misses));
+                static_cast<unsigned long long>(stats.misses),
+                pct(stats.hits, stats.hits + stats.misses),
+                static_cast<unsigned long long>(stats.evictions),
+                static_cast<unsigned long long>(stats.entries),
+                static_cast<unsigned long long>(stats.capacity),
+                pct(stats.entries, stats.capacity));
     return 0;
 }
 

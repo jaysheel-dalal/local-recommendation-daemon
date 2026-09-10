@@ -84,6 +84,14 @@ struct Header {
 };
 
 /// Counters returned by StatsRequest.
+///
+/// Step 3 added the last three. Appending fields to a message is a *breaking*
+/// change under this protocol: the decoder rejects trailing bytes, so a step 2
+/// client talking to a step 3 daemon gets DecodeError::TrailingBytes rather
+/// than silently misreading the reply. That strictness is the intended
+/// behaviour - it turns version skew into a loud, immediate failure instead of
+/// plausible-looking wrong numbers. Nothing is deployed, so v1 is edited in
+/// place; a shipped protocol would have bumped kVersion here.
 struct Stats {
     std::uint64_t requests = 0;
     std::uint64_t gets = 0;
@@ -91,6 +99,9 @@ struct Stats {
     std::uint64_t deletes = 0;
     std::uint64_t hits = 0;
     std::uint64_t misses = 0;
+    std::uint64_t evictions = 0;  ///< Entries dropped by the LRU policy.
+    std::uint64_t entries = 0;    ///< Current occupancy.
+    std::uint64_t capacity = 0;   ///< Maximum occupancy.
 };
 
 /// One request in decoded form.

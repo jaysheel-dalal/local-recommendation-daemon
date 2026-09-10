@@ -134,6 +134,9 @@ void BinaryCodec::encode(const Response& response, ByteBuffer& out) const {
             writer.u64(response.stats.deletes);
             writer.u64(response.stats.hits);
             writer.u64(response.stats.misses);
+            writer.u64(response.stats.evictions);
+            writer.u64(response.stats.entries);
+            writer.u64(response.stats.capacity);
             break;
         case MessageType::ErrorResponse:
             writer.u8(static_cast<std::uint8_t>(response.status));
@@ -215,6 +218,9 @@ DecodeError BinaryCodec::decode(ByteView body, Response& out) const {
             out.stats.deletes = reader.u64();
             out.stats.hits = reader.u64();
             out.stats.misses = reader.u64();
+            out.stats.evictions = reader.u64();
+            out.stats.entries = reader.u64();
+            out.stats.capacity = reader.u64();
             break;
         default:
             return DecodeError::UnknownType;

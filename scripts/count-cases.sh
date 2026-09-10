@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 cd "$(dirname "$0")/.."
 total=0
-for t in test_version test_fd test_io test_unix_socket test_wire test_codec test_framing test_handler; do
+for t in test_version test_fd test_io test_unix_socket test_wire test_codec test_framing test_lru_cache test_handler; do
   line=$("./build/debug/bin/$t" 2>/dev/null | grep 'case(s)')
   n=$(echo "$line" | awk '{print $1}')
   total=$((total + n))
