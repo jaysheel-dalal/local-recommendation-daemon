@@ -14,6 +14,7 @@
 #include "lrd/common/log.hpp"
 #include "lrd/common/version.hpp"
 #include "lrd/daemon/server.hpp"
+#include "lrd/proto/codec.hpp"
 
 #include <cstddef>
 #include <cstdio>
@@ -49,6 +50,7 @@ void print_usage(const char* argv0) {
         "\n"
         "  --socket PATH   unix domain socket to listen on (default: %.*s)\n"
         "  --capacity N    cache entries before LRU eviction (default: %zu)\n"
+        "  --codec NAME    wire codec: %.*s (default: binary)\n"
         "  --shards N      cache shards, power of two (default: %zu)\n"
         "  --threads N     worker threads (default: one per core)\n"
         "  --queue N       connections queued awaiting a worker (default: %zu)\n"
@@ -56,7 +58,8 @@ void print_usage(const char* argv0) {
         "  --version       print version and exit\n"
         "  --help          print this message and exit\n",
         argv0, static_cast<int>(kDefaultSocketPath.size()), kDefaultSocketPath.data(),
-        kDefaultCapacity, kDefaultShards, kDefaultQueue);
+        kDefaultCapacity, static_cast<int>(lrd::proto::available_codecs().size()),
+        lrd::proto::available_codecs().data(), kDefaultShards, kDefaultQueue);
 }
 
 bool parse_size(const char* text, std::size_t& out, const char* name) {
@@ -86,6 +89,8 @@ bool parse_args(int argc, char** argv, Options& out) {
             if (!parse_size(argv[++i], out.config.cache_capacity, "--capacity")) {
                 return false;
             }
+        } else if (arg == "--codec" && i + 1 < argc) {
+            out.config.codec_name = argv[++i];
         } else if (arg == "--shards" && i + 1 < argc) {
             if (!parse_size(argv[++i], out.config.cache_shards, "--shards")) {
                 return false;

@@ -43,7 +43,8 @@ void print_usage(const char* argv0) {
         "  stats                 daemon counters\n"
         "  pipeline N            N put/get pairs on one connection\n"
         "\n"
-        "  --socket PATH         daemon socket (default: %.*s)\n",
+        "  --socket PATH         daemon socket (default: %.*s)\n"
+        "  --codec NAME          wire codec, must match the daemon (default: binary)\n",
         argv0, static_cast<int>(kDefaultSocketPath.size()), kDefaultSocketPath.data());
 }
 
@@ -164,6 +165,7 @@ int cmd_pipeline(Connection& connection, std::size_t count) {
 
 int main(int argc, char** argv) {
     std::string socket_path{kDefaultSocketPath};
+    std::string codec_name{"binary"};
     std::vector<std::string_view> args;
 
     for (int i = 1; i < argc; ++i) {
@@ -180,6 +182,14 @@ int main(int argc, char** argv) {
             socket_path = argv[++i];
             continue;
         }
+        if (arg == "--codec") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "lrd_cli: --codec requires a name\n");
+                return 2;
+            }
+            codec_name = argv[++i];
+            continue;
+        }
         args.push_back(arg);
     }
 
@@ -189,7 +199,7 @@ int main(int argc, char** argv) {
     }
 
     try {
-        Connection connection = Connection::connect(socket_path);
+        Connection connection = Connection::connect(socket_path, codec_name);
         const std::string_view command = args[0];
 
         if (command == "get" && args.size() == 2) {

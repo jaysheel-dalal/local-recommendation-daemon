@@ -1,0 +1,130 @@
+// lrd wire protocol, protobuf encoding.
+//
+// This describes the *body* of a frame - everything after the 4-byte length
+// prefix. The framing layer is unchanged and shared with binary/v1, because
+// protobuf deliberately does not do framing: it will happily parse a prefix of
+// a message as a valid shorter message, so something outside it has to say
+// where a message ends. That is what the length prefix is for, and it is why
+// adding protobuf did not make it redundant.
+//
+// See docs/protocol.md for the binary/v1 layout and the comparison.
+
+syntax = "proto3";
+
+package lrd.wire;
+
+// ---------------------------------------------------------------------------
+// Field types
+// ---------------------------------------------------------------------------
+
+// `bytes`, not `string`, for keys and values.
+//
+// A protobuf `string` is required to be valid UTF-8, and implementations are
+// permitted to reject anything else. Our keys and values are arbitrary byte
+// strings - the test suite deliberately round-trips embedded NULs and
+// non-textual data. Declaring them `string` would compile, pass casual testing,
+// and corrupt or reject real payloads. `bytes` has identical wire encoding with
+// no validation attached.
+
+enum Status {
+  // proto3 requires the first enumerator to be zero, which lines up with
+  // StatusCode::Ok. That is convenient rather than accidental: zero is the
+  // implicit default, so a message that omits the field means "Ok".
+  STATUS_OK = 0;
+  STATUS_NOT_FOUND = 1;
+  STATUS_INVALID_REQUEST = 2;
+  STATUS_INTERNAL = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------
+
+message GetRequest {
+  bytes key = 1;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message DeleteRequest {
+  bytes key = 1;
+}
+
+message StatsRequest {}
+
+// ---------------------------------------------------------------------------
+// Responses
+// ---------------------------------------------------------------------------
+
+message Stats {
+  uint64 requests = 1;
+  uint64 gets = 2;
+  uint64 puts = 3;
+  uint64 deletes = 4;
+  uint64 hits = 5;
+  uint64 misses = 6;
+  // Appended in step 3. Under binary/v1 this was a breaking change, because
+  // that decoder rejects trailing bytes; here it is additive and an older peer
+  // simply ignores the new fields. That difference is the whole argument for
+  // protobuf, and docs/benchmarks.md demonstrates it running.
+  uint64 evictions = 7;
+  uint64 entries = 8;
+  uint64 capacity = 9;
+}
+
+message GetResponse {
+  Status status = 1;
+  bytes value = 2;
+}
+
+message PutResponse {
+  Status status = 1;
+}
+
+message DeleteResponse {
+  Status status = 1;
+}
+
+message StatsResponse {
+  Status status = 1;
+  Stats stats = 2;
+}
+
+message ErrorResponse {
+  Status status = 1;
+  bytes message = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Envelope
+// ---------------------------------------------------------------------------
+
+// One message type on the wire, carrying whichever body applies.
+//
+// The `oneof` replaces binary/v1's explicit type byte *and* its response bit:
+// `body_case()` says which message this is, and whether it is a request or a
+// response falls out of that. A receiver expecting a request and handed a
+// response rejects it on the case alone, before touching any payload.
+//
+// Field numbers 1-15 encode their tag in a single byte, so the fields on every
+// message stay in that range. `request_id` takes 1 because it is present on
+// every message; the oneof arms take 2-10.
+message Envelope {
+  uint64 request_id = 1;
+
+  oneof body {
+    GetRequest get_request = 2;
+    PutRequest put_request = 3;
+    DeleteRequest delete_request = 4;
+    StatsRequest stats_request = 5;
+
+    GetResponse get_response = 6;
+    PutResponse put_response = 7;
+    DeleteResponse delete_response = 8;
+    StatsResponse stats_response = 9;
+    ErrorResponse error_response = 10;
+  }
+}

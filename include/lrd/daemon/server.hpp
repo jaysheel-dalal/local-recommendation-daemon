@@ -32,6 +32,12 @@ struct ServerConfig {
     /// stall - see the starvation note on run().
     std::size_t max_queued_connections = 64;
 
+    /// "binary" or "protobuf". Both ends of a connection must agree - there is
+    /// no negotiation, which is a deliberate simplification documented in
+    /// docs/protocol.md. A mismatch fails loudly rather than silently, because
+    /// neither format parses the other's bytes.
+    std::string codec_name = "binary";
+
     bool verbose = false;
 };
 
@@ -112,7 +118,10 @@ private:
     net::UnixListener listener_;
     Handler handler_;
     ConnectionRegistry registry_;
-    proto::BinaryCodec codec_;
+    /// Held by pointer, not by value, because the concrete codec is chosen at
+    /// runtime from a flag. This is the seam from step 2 finally being used for
+    /// what it was built for.
+    std::unique_ptr<proto::Codec> codec_;
 
     /// The self-pipe. A signal can arrive while the acceptor is blocked in
     /// accept(), and nothing about setting a flag would wake it. Writing a byte

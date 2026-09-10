@@ -1,4 +1,26 @@
 # ---------------------------------------------------------------------------
+# lrd_proto_gen - protoc output.
+#
+# A separate target on purpose: generated code is deliberately NOT compiled with
+# lrd_options. Our warning set (-Wconversion, -Wold-style-cast, -Werror and the
+# rest) is a style contract for code we write and review; holding a code
+# generator to it means either a wall of suppressions or patching generated
+# files, and it would break on the next protoc release. The include directory is
+# marked SYSTEM so that warnings from lrd.pb.h do not fire in our translation
+# units either.
+# ---------------------------------------------------------------------------
+if(LRD_WITH_PROTOBUF)
+    protobuf_generate_cpp(LRD_PROTO_SRCS LRD_PROTO_HDRS
+        "${CMAKE_SOURCE_DIR}/proto/lrd.proto")
+
+    add_library(lrd_proto_gen STATIC ${LRD_PROTO_SRCS} ${LRD_PROTO_HDRS})
+
+    # SYSTEM: suppresses generated-header warnings for every consumer.
+    target_include_directories(lrd_proto_gen SYSTEM PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(lrd_proto_gen PUBLIC protobuf::libprotobuf)
+endif()
+
+# ---------------------------------------------------------------------------
 # lrd_core - everything reusable: transport, framing, codec, cache, pool.
 # Built as a static library so the daemon, the client library, the bench tool
 # and the unit tests all compile it exactly once and share one definition.
@@ -30,6 +52,14 @@ target_compile_definitions(lrd_core PRIVATE
 target_link_libraries(lrd_core
     PUBLIC Threads::Threads
     PRIVATE lrd_options)
+
+if(LRD_WITH_PROTOBUF)
+    target_sources(lrd_core PRIVATE proto/protobuf_codec.cpp)
+    target_link_libraries(lrd_core PUBLIC lrd_proto_gen)
+    # PUBLIC so that tests and benchmarks can #ifdef on the same symbol lrd_core
+    # was compiled with, rather than guessing.
+    target_compile_definitions(lrd_core PUBLIC LRD_WITH_PROTOBUF)
+endif()
 
 # ---------------------------------------------------------------------------
 # lrd_client - the client library. Separate from the lrd_cli binary so that

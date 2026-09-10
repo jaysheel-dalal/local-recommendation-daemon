@@ -21,6 +21,10 @@
 #include "lrd/proto/codec.hpp"
 #include "lrd/proto/message.hpp"
 
+#ifdef LRD_WITH_PROTOBUF
+#include "lrd/proto/protobuf_codec.hpp"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <chrono>

@@ -19,10 +19,17 @@ const char* to_string(CallStatus status) noexcept {
     return "Unknown";
 }
 
-Connection::Connection(net::UnixStream stream) noexcept : stream_(std::move(stream)) {}
+Connection::Connection(net::UnixStream stream, std::string_view codec_name)
+    : stream_(std::move(stream)), codec_(proto::make_codec(codec_name)) {
+    if (!codec_) {
+        throw std::invalid_argument(
+            std::format("unknown codec '{}'; available: {}", codec_name,
+                        proto::available_codecs()));
+    }
+}
 
-Connection Connection::connect(std::string_view socket_path) {
-    return Connection(net::UnixStream::connect(socket_path));
+Connection Connection::connect(std::string_view socket_path, std::string_view codec_name) {
+    return Connection(net::UnixStream::connect(socket_path), codec_name);
 }
 
 CallStatus Connection::fail(CallStatus status, std::string message) {
@@ -34,7 +41,7 @@ CallStatus Connection::call(const proto::Request& request, proto::Response& resp
     last_error_.clear();
 
     const proto::FrameResult written =
-        proto::write_message(stream_, codec_, request, write_buffer_);
+        proto::write_message(stream_, *codec_, request, write_buffer_);
     if (!written) {
         // A failed write leaves the daemon's view of the stream unknown - it may
         // have received half a frame. The connection cannot be reused, so it is
@@ -52,7 +59,7 @@ CallStatus Connection::call(const proto::Request& request, proto::Response& resp
                     std::format("receive failed: {}", proto::to_string(read.status)));
     }
 
-    if (const proto::DecodeError error = codec_.decode(read_buffer_, response);
+    if (const proto::DecodeError error = codec_->decode(read_buffer_, response);
         error != proto::DecodeError::None) {
         // The daemon sent something we cannot parse. Same reasoning as the
         // daemon's own framing errors: the stream can no longer be trusted.

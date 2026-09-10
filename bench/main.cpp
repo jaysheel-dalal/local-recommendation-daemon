@@ -42,6 +42,7 @@ using lrd::client::Connection;
 
 struct Options {
     std::string socket_path = "/tmp/lrd.sock";
+    std::string codec_name = "binary";
     std::size_t threads = 4;
     std::size_t requests_per_thread = 20000;
     std::size_t warmup_per_thread = 2000;
@@ -60,6 +61,7 @@ void print_usage(const char* argv0) {
         "usage: %s [options]\n"
         "\n"
         "  --socket PATH      daemon socket (default: /tmp/lrd.sock)\n"
+        "  --codec NAME       wire codec, must match the daemon (default: binary)\n"
         "  --threads N        concurrent client connections (default: 4)\n"
         "  --requests N       measured requests per thread (default: 20000)\n"
         "  --warmup N         unmeasured requests per thread first (default: 2000)\n"
@@ -105,6 +107,8 @@ bool parse_args(int argc, char** argv, Options& out) {
             out.sweep = true;
         } else if (arg == "--socket" && has_value) {
             out.socket_path = argv[++i];
+        } else if (arg == "--codec" && has_value) {
+            out.codec_name = argv[++i];
         } else if (arg == "--threads" && has_value) {
             if (!parse_size(argv[++i], out.threads)) return false;
         } else if (arg == "--requests" && has_value) {
@@ -148,7 +152,7 @@ void run_thread(const Options& opts, std::size_t thread_index, const std::vector
     // One Connection per thread. Connection is deliberately not thread-safe -
     // it is a single request/response stream, and interleaving two threads'
     // frames on it would desynchronise the protocol.
-    Connection connection = Connection::connect(opts.socket_path);
+    Connection connection = Connection::connect(opts.socket_path, opts.codec_name);
 
     // Seeded per thread so the threads do not all walk the same key sequence in
     // lockstep, but deterministically so a run is reproducible.
@@ -298,6 +302,7 @@ RunResult run_once(const Options& opts, std::size_t threads) {
 void describe(const Options& opts) {
     std::printf("lrd_bench: %s\n", std::string(lrd::build_info()).c_str());
     std::printf("  socket      %s\n", opts.socket_path.c_str());
+    std::printf("  codec       %s\n", opts.codec_name.c_str());
     std::printf("  keys        %zu (zipf theta %.2f)\n", opts.key_count, opts.zipf_theta);
     std::printf("  value       %zu bytes\n", opts.value_size);
     std::printf("  read ratio  %.2f\n", opts.read_ratio);

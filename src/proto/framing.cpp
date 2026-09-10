@@ -65,10 +65,10 @@ FrameResult read_frame(net::UnixStream& stream, ByteBuffer& body) {
     // in two: `length` is a number chosen by a peer we do not trust, and the
     // next statement would otherwise hand it straight to resize().
     //
-    // A frame shorter than the header cannot be valid either - catching it here
-    // means the codec never has to defend against a body too small to hold the
-    // fields it is about to read.
-    if (length < kHeaderSize || length > kMaxFrameSize) {
+    // The lower bound is kMinFrameSize (1), not any codec's header size. See
+    // the comment on kMinFrameSize: putting binary/v1's 16-byte header in this
+    // check silently broke every protobuf frame smaller than that.
+    if (length < kMinFrameSize || length > kMaxFrameSize) {
         FrameResult result;
         result.status = FrameStatus::Oversized;
         result.length = length;
@@ -98,7 +98,7 @@ namespace detail {
 FrameResult write_prefixed(net::UnixStream& stream, ByteBuffer& framed) {
     const std::size_t body_size = framed.size() - kLengthPrefixSize;
 
-    if (body_size < kHeaderSize || body_size > kMaxFrameSize) {
+    if (body_size < kMinFrameSize || body_size > kMaxFrameSize) {
         FrameResult result;
         result.status = FrameStatus::Oversized;
         result.length = static_cast<std::uint32_t>(body_size);
@@ -119,7 +119,7 @@ FrameResult write_prefixed(net::UnixStream& stream, ByteBuffer& framed) {
 }  // namespace detail
 
 FrameResult write_frame(net::UnixStream& stream, ByteView body) {
-    if (body.size() < kHeaderSize || body.size() > kMaxFrameSize) {
+    if (body.size() < kMinFrameSize || body.size() > kMaxFrameSize) {
         FrameResult result;
         result.status = FrameStatus::Oversized;
         result.length = static_cast<std::uint32_t>(body.size());

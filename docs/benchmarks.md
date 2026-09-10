@@ -261,3 +261,101 @@ threads in process, +43% end to end).
 The number is a `--shards` flag precisely because the right value depends on
 core count and cache size, and both are properties of the deployment rather than
 of the code.
+
+---
+
+# Step 8: BinaryCodec versus ProtobufCodec
+
+Both implementations sit behind the same `Codec` interface from step 2 and pass
+the same conformance suite, so the daemon runs either from a `--codec` flag with
+no recompilation.
+
+## Codec CPU and wire size, in process
+
+`lrd_codec_bench`, 24-byte key, 128-byte value, 300k iterations, median of 3.
+
+| message | binary encode | protobuf encode | binary decode | protobuf decode | binary bytes | protobuf bytes |
+|---|---:|---:|---:|---:|---:|---:|
+| GetRequest | 61 ns | 168 ns | 47 ns | 198 ns | 44 | **38** |
+| PutRequest | 80 ns | 290 ns | 71 ns | 372 ns | 176 | **170** |
+| StatsRequest | 48 ns | 77 ns | 27 ns | 81 ns | 16 | **4** |
+| GetResponse | 66 ns | 155 ns | 65 ns | 256 ns | 149 | **144** |
+| PutResponse | 43 ns | 89 ns | 39 ns | 110 ns | 17 | **12** |
+| StatsResponse | **225 ns** | 137 ns | 73 ns | 218 ns | 89 | **22** |
+
+**Protobuf costs 2-5x more CPU per message and is smaller on the wire every
+time.** Neither of those is surprising on its own. Two rows are worth reading
+more closely.
+
+**`StatsResponse` is the one message protobuf encodes *faster*** - 137 ns against
+225 ns - and it is 4x smaller (22 bytes against 89). Both come from the same
+cause: the message is nine `uint64` counters, and protobuf varint-encodes them,
+so a value of 45 occupies one byte. binary/v1 writes all nine as fixed 8-byte
+big-endian fields - 72 bytes of payload - one byte at a time through a
+`push_back` loop. Fixed-width encoding is simple and fast to *decode*; it is
+neither when the numbers are small and numerous.
+
+That 225 ns outlier was visible in the baseline taken before ProtobufCodec
+existed, which is why the baseline was worth taking first. It is a real
+inefficiency in our own encoder - a `resize`-then-write would fix it - and the
+comparison is what explained it.
+
+**`StatsRequest` is 4 bytes under protobuf against 16 under binary/v1**, because
+an empty protobuf message carrying one small field is nearly free while
+binary/v1 always pays its fixed 16-byte header. Per-frame magic and version have
+a cost, and this is it.
+
+## End to end
+
+Three interleaved rounds, 8 client threads, 5000 requests per thread, median of
+3 trials per round.
+
+| round | binary ops/sec | protobuf ops/sec | binary p50 | protobuf p50 |
+|---|---:|---:|---:|---:|
+| 1 | 180,272 | 238,655 | 23.0 us | 25.9 us |
+| 2 | 224,586 | 146,969 | 22.6 us | 26.4 us |
+| 3 | 172,743 | 159,286 | 23.2 us | 26.9 us |
+
+**Throughput is indistinguishable.** The ordering flips between rounds and the
+ranges overlap heavily. Anyone reporting a number from a single run here would
+be reporting noise - the first run of this comparison showed protobuf 36% slower
+and the second showed it 8% faster.
+
+**p50 latency is consistently ~3.4 us (15%) higher for protobuf**, and that one
+*is* stable: 23.0/22.6/23.2 against 25.9/26.4/26.9, tight across every round.
+
+Worth noting the size of that gap against what the microbenchmark predicts. A
+request involves four codec operations - client encodes, daemon decodes, daemon
+encodes, client decodes - which sums to roughly 240 ns for binary and 780 ns for
+protobuf, a difference of about 0.5 us. The observed gap is 3.4 us, some six
+times larger. The extra is second-order: protobuf allocates more per message,
+and at 8 client threads plus 16 worker threads on 8 cores the machine is
+CPU-saturated, so additional work per request costs more than the work itself.
+
+The honest summary is that **the codec choice does not change what this daemon
+can deliver, and does slightly worsen its latency.** Which is the answer the
+step 6 reasoning predicted for throughput, arrived at properly this time - by
+measuring repeatedly rather than by reasoning from a mean.
+
+## So which would you choose?
+
+Not a performance question, on this evidence. A failure-mode question:
+
+| | binary/v1 | protobuf/v1 |
+|---|---|---|
+| Adding a field | **Breaking.** Decoder rejects trailing bytes - this actually happened in step 3. | **Additive.** Unknown fields are preserved; an old peer ignores them. |
+| Desynchronised stream | Caught immediately by per-frame magic. | No magic to check; usually caught because a binary body's first byte is an invalid protobuf tag. |
+| Truncation | Rejected at any offset. | **Not reliably detectable** - a message of optional fields cut on a field boundary parses as a valid shorter message. |
+| Schema as documentation | Prose in `docs/protocol.md`. | `proto/lrd.proto`, machine-checked, and generates other languages. |
+| Dependency | None. | protoc plus libprotobuf at build and run time. |
+
+binary/v1 fails loudly on anything unexpected. protobuf tolerates the unexpected
+so that versions can drift apart safely. For a daemon and an SDK shipped
+together on one device, either is defensible; for anything crossing a team or a
+release boundary, protobuf's evolution story is worth the CPU and the dependency.
+
+**The truncation row is the one that changed a design decision.** Protobuf
+cannot reliably tell a short message from a complete one, so the length prefix
+introduced in step 2 is not made redundant by adopting protobuf - it is what
+makes truncation detectable at all. That is now asserted in
+`tests/codec_conformance.hpp` rather than assumed.

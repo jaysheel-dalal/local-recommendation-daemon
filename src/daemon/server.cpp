@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <chrono>
 #include <thread>
+#include <format>
 #include <utility>
 
 namespace lrd::daemon {
@@ -70,10 +71,15 @@ Server::Server(ServerConfig config)
     : config_(std::move(config)),
       listener_(net::UnixListener::bind(config_.socket_path)),
       handler_(config_.cache_capacity, config_.cache_shards),
+      codec_(proto::make_codec(config_.codec_name)),
       stop_(make_stop_pipe()),
       pool_(config_.thread_count, config_.max_queued_connections) {
+    if (!codec_) {
+        throw SystemError(EINVAL, std::format("unknown codec '{}'; available: {}",
+                                              config_.codec_name, proto::available_codecs()));
+    }
     log_info("codec: {}, cache: {} entries across {} shards, worker threads: {}, queue: {}",
-             codec_.name(), config_.cache_capacity, config_.cache_shards, config_.thread_count,
+             codec_->name(), config_.cache_capacity, config_.cache_shards, config_.thread_count,
              config_.max_queued_connections);
 }
 
@@ -268,7 +274,7 @@ void Server::serve_connection(net::UnixStream stream) {
         }
 
         proto::Request request;
-        const proto::DecodeError error = codec_.decode(request_body, request);
+        const proto::DecodeError error = codec_->decode(request_body, request);
 
         if (error != proto::DecodeError::None) {
             // A semantic problem leaves the stream in a known state, so it is
@@ -284,7 +290,7 @@ void Server::serve_connection(net::UnixStream stream) {
             const proto::Response rejection =
                 proto::make_error(request.request_id, proto::StatusCode::InvalidRequest,
                                   proto::to_string(error));
-            if (!proto::write_message(stream, codec_, rejection, response_body)) {
+            if (!proto::write_message(stream, *codec_, rejection, response_body)) {
                 break;
             }
             continue;
@@ -300,7 +306,7 @@ void Server::serve_connection(net::UnixStream stream) {
         // another.
         const proto::Response response = handler_.handle(request);
 
-        if (!proto::write_message(stream, codec_, response, response_body)) {
+        if (!proto::write_message(stream, *codec_, response, response_body)) {
             break;
         }
         ++served;

@@ -1,5 +1,11 @@
 #include "lrd/proto/codec.hpp"
 
+#ifdef LRD_WITH_PROTOBUF
+#include "lrd/proto/protobuf_codec.hpp"
+#endif
+
+#include <memory>
+
 namespace lrd::proto {
 
 namespace {
@@ -39,6 +45,26 @@ DecodeError finish(ByteReader& reader) noexcept {
 }
 
 }  // namespace
+
+std::unique_ptr<Codec> make_codec(std::string_view name) {
+    if (name == "binary" || name == "binary/v1") {
+        return std::make_unique<BinaryCodec>();
+    }
+#ifdef LRD_WITH_PROTOBUF
+    if (name == "protobuf" || name == "protobuf/v1") {
+        return std::make_unique<ProtobufCodec>();
+    }
+#endif
+    return nullptr;
+}
+
+std::string_view available_codecs() noexcept {
+#ifdef LRD_WITH_PROTOBUF
+    return "binary, protobuf";
+#else
+    return "binary (this build has no protobuf support)";
+#endif
+}
 
 void encode_header(const Header& header, ByteWriter& writer) {
     writer.u32(kMagic);

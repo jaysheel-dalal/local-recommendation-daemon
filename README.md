@@ -30,7 +30,15 @@ milestone.
 | 6 | Benchmark client (throughput, p50/p90/p99) | ✅ done |
 | 7 | Sharded cache + contention measurements | ✅ done |
 
-**Phase 1 is complete.**
+**Phase 1 complete.** Phase 2 turns it into the recommendation engine.
+
+| Step | Component | State |
+|-----:|-----------|-------|
+| 8 | ProtobufCodec behind the Phase 1 seam, benchmarked | ✅ done |
+| 9 | Item metadata + candidate ranking | ⏳ next |
+| 10 | Compliance: exposure cap, frequency limit | — |
+| 11 | Client SDK | — |
+| 12 | Privacy: noise on exported metrics | — |
 
 Phase 2 (candidate ranking, exposure/frequency policy, client SDK, privacy
 noise) begins once step 7 lands.
@@ -67,8 +75,13 @@ ThreadSanitizer reports it, so that a clean TSan run is evidence rather than
 decoration. Everything compiles with `-Wall -Wextra -Wpedantic
 -Wconversion -Wshadow -Wold-style-cast -Werror`.
 
-Requires only a C++20 compiler, CMake ≥ 3.20 and pthreads. No third-party
-dependencies in Phase 1 — see *Wire format* below for why.
+Requires a C++20 compiler, CMake ≥ 3.20 and pthreads. Protocol Buffers is
+optional and auto-detected — without it the tree still builds and tests, minus
+`ProtobufCodec`:
+
+```bash
+sudo apt install -y protobuf-compiler libprotobuf-dev   # optional
+```
 
 ---
 
@@ -133,13 +146,24 @@ phenomenon, and comparing mean service times hides it. Full write-up in
 Longer write-ups live in `docs/`. The short version of the decisions that
 matter:
 
-**Wire format — hand-rolled binary in Phase 1, Protocol Buffers in Phase 2,
-behind one `Codec` interface.** `SOCK_STREAM` gives you a byte stream with no
-message boundaries, so framing has to exist regardless of what serialises the
-payload. Writing it by hand first makes short reads, `EINTR` and byte order
-explicit rather than hiding them behind `ParseFromArray`. Phase 2 adds a
-protobuf codec behind the same interface, so the two are directly comparable on
-the same benchmark.
+**Two wire formats behind one `Codec` interface**, selected by `--codec` at
+runtime. Writing the binary one by hand first made short reads, `EINTR` and byte
+order explicit rather than hiding them behind `ParseFromArray`; step 8 added
+protobuf behind the same interface and measured both.
+
+The comparison landed somewhere more interesting than "protobuf is slower":
+protobuf costs **2–5× the CPU per message** and is **smaller on the wire every
+time**, but end-to-end throughput is **indistinguishable** (the ordering flipped
+between measurement rounds), with p50 latency consistently ~15% higher. So the
+choice is not about speed — it is about failure modes. binary/v1 fails loudly on
+anything unexpected; protobuf tolerates the unexpected so versions can drift
+apart safely. Adding three `Stats` fields in step 3 was a *breaking* change under
+binary/v1 and would have been additive under protobuf.
+
+**And protobuf does not make the length prefix redundant.** It cannot reliably
+detect truncation — a message of optional fields cut on a field boundary parses
+as a valid shorter message — so the framing layer is what catches a short read.
+That is asserted in the shared conformance suite, not assumed.
 
 **A reader-writer lock is the wrong default for an LRU cache.** A cache hit
 moves its entry to most-recently-used, so `get()` mutates — taking a shared

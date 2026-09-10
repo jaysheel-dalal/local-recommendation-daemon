@@ -3,6 +3,9 @@
 #include "lrd/proto/message.hpp"
 #include "lrd/proto/wire.hpp"
 
+#include <memory>
+#include <string_view>
+
 namespace lrd::proto {
 
 /// Turns messages into frame bodies and back.
@@ -58,6 +61,18 @@ public:
     [[nodiscard]] DecodeError decode(ByteView body, Request& out) const override;
     [[nodiscard]] DecodeError decode(ByteView body, Response& out) const override;
 };
+
+/// Creates a codec by name: "binary" or "protobuf". Returns nullptr for an
+/// unknown name, or for "protobuf" in a build without protobuf support.
+///
+/// A factory rather than a template parameter, because the choice is a runtime
+/// flag - the whole point of the seam is running the same daemon both ways
+/// without recompiling. See the note on Codec above for why one virtual call
+/// per message is affordable here.
+[[nodiscard]] std::unique_ptr<Codec> make_codec(std::string_view name);
+
+/// Names accepted by make_codec in this build, for help text and errors.
+[[nodiscard]] std::string_view available_codecs() noexcept;
 
 /// Validates the fixed header and leaves the reader positioned at the payload.
 /// Exposed for tests, which want to assert on header rejection independently

@@ -17,6 +17,20 @@ inline constexpr std::size_t kLengthPrefixSize = 4;
 /// A frame length is an allocation request from a peer. These caps are what
 /// stop four bytes of 0xFF from asking the daemon to reserve 4 GiB.
 inline constexpr std::uint32_t kMaxFrameSize = 1024 * 1024;
+
+/// Smallest frame body the framing layer will accept.
+///
+/// Deliberately 1, not kHeaderSize. The framing layer originally rejected
+/// anything shorter than binary/v1's 16-byte header, which was a codec-specific
+/// constant living in a codec-agnostic layer - and it stayed invisible until a
+/// second codec existed. A protobuf PutResponse is 12 bytes and a StatsRequest
+/// is 4, so framing was rejecting perfectly valid frames as Oversized.
+///
+/// Framing's job is to find message boundaries and to bound allocation. Whether
+/// the bytes inside are long enough to mean anything is the codec's judgement,
+/// and both codecs already make it: binary/v1's reader fails on a short read,
+/// and protobuf's parser rejects a malformed envelope.
+inline constexpr std::uint32_t kMinFrameSize = 1;
 inline constexpr std::uint32_t kMaxKeyLength = 1024;
 inline constexpr std::uint32_t kMaxValueLength = 512 * 1024;
 

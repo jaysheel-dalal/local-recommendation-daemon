@@ -6,6 +6,8 @@
 #include "lrd/proto/wire.hpp"
 
 #include <cstdint>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -42,9 +44,12 @@ public:
     /// Connects to the daemon. Throws SystemError if the socket cannot be
     /// reached - a constructor cannot return a status, and a half-built
     /// Connection is not a thing worth representing.
-    [[nodiscard]] static Connection connect(std::string_view socket_path);
+    /// `codec_name` must match the daemon's. There is no negotiation - see
+    /// ServerConfig::codec_name for why that is a deliberate simplification.
+    [[nodiscard]] static Connection connect(std::string_view socket_path,
+                                            std::string_view codec_name = "binary");
 
-    explicit Connection(net::UnixStream stream) noexcept;
+    explicit Connection(net::UnixStream stream, std::string_view codec_name = "binary");
 
     /// Fetches `key`. Returns NotFound with `value` untouched if absent.
     [[nodiscard]] CallStatus get(std::string_view key, std::string& value);
@@ -70,7 +75,7 @@ private:
     [[nodiscard]] CallStatus fail(CallStatus status, std::string message);
 
     net::UnixStream stream_;
-    proto::BinaryCodec codec_;
+    std::unique_ptr<proto::Codec> codec_;
     proto::ByteBuffer read_buffer_;
     proto::ByteBuffer write_buffer_;
     std::uint64_t next_request_id_ = 1;

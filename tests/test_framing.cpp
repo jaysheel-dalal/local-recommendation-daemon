@@ -146,15 +146,47 @@ LRD_TEST("a length just over the cap is rejected") {
     LRD_CHECK(result.status == FrameStatus::Oversized);
 }
 
-LRD_TEST("a length too small to hold a header is rejected") {
-    // Catching this at the framing layer means the codec never has to defend
-    // against a body too short for the fields it is about to read.
-    StreamPair pair = StreamPair::create();
-    write_raw(pair.a, length_prefix(kHeaderSize - 1));
+LRD_TEST("a zero-length frame is rejected, but a short one is not") {
+    // The layering fix from step 8. Framing used to reject anything shorter
+    // than binary/v1's 16-byte header - a codec-specific constant in a
+    // codec-agnostic layer. It stayed invisible until protobuf arrived, whose
+    // PutResponse is 12 bytes and StatsRequest is 4: framing was refusing valid
+    // frames as Oversized.
+    //
+    // Now framing only enforces "at least one byte, at most the cap", and
+    // whether the contents mean anything is the codec's call.
+    {
+        StreamPair pair = StreamPair::create();
+        write_raw(pair.a, length_prefix(0));
+        ByteBuffer body;
+        LRD_CHECK(read_frame(pair.b, body).status == FrameStatus::Oversized);
+    }
+    {
+        StreamPair pair = StreamPair::create();
+        // Exactly binary/v1's magic and nothing else: four bytes, valid as far
+        // as they go. Chosen so the codec gets past the magic check and fails on
+        // running out of bytes, which is the rejection this case is about.
+        // (A body of arbitrary bytes would fail earlier, on BadMagic, and prove
+        // less.)
+        ByteBuffer short_body;
+        short_body.push_back(std::byte{0x4C});
+        short_body.push_back(std::byte{0x52});
+        short_body.push_back(std::byte{0x44});
+        short_body.push_back(std::byte{0x31});
 
-    ByteBuffer body;
-    const FrameResult result = read_frame(pair.b, body);
-    LRD_CHECK(result.status == FrameStatus::Oversized);
+        write_raw(pair.a, length_prefix(4));
+        write_raw(pair.a, short_body);
+
+        ByteBuffer body;
+        const FrameResult result = read_frame(pair.b, body);
+        LRD_REQUIRE(result.ok());
+        LRD_CHECK_EQ(body.size(), std::size_t{4});
+
+        // And the binary codec - not the framing layer - is what rejects it.
+        const BinaryCodec codec;
+        Request decoded;
+        LRD_CHECK(codec.decode(body, decoded) == DecodeError::Truncated);
+    }
 }
 
 LRD_TEST("a clean disconnect between frames is not an error") {
@@ -210,7 +242,7 @@ LRD_TEST("writing to a closed peer reports PeerClosed") {
 LRD_TEST("write_frame refuses a body that cannot be framed") {
     StreamPair pair = StreamPair::create();
 
-    const ByteBuffer too_small(kHeaderSize - 1);
+    const ByteBuffer too_small;  // empty
     LRD_CHECK(write_frame(pair.a, too_small).status == FrameStatus::Oversized);
 
     const ByteBuffer too_big(kMaxFrameSize + 1);

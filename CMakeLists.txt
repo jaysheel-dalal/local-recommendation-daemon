@@ -66,6 +66,30 @@ if(NOT LRD_SANITIZER STREQUAL "none")
     message(STATUS "lrd: ${LRD_SANITIZER} sanitizer ENABLED")
 endif()
 
+# ---------------------------------------------------------------------------
+# Protocol Buffers (optional).
+#
+# MODULE, not CONFIG, and not by accident: protobuf 3.21 as packaged here ships
+# no CMake config that CMake 4.2 will accept, so find_package(Protobuf CONFIG)
+# fails outright. CMake's own FindProtobuf module works and provides both the
+# protobuf::libprotobuf imported target and protobuf_generate_cpp. Verified with
+# scripts/probe-protobuf-cmake.sh.
+#
+# Auto-detected rather than required: the whole of Phase 1 builds without
+# protobuf, and someone cloning this repo should not need it to run the tests.
+# ---------------------------------------------------------------------------
+option(LRD_WITH_PROTOBUF "Build the protobuf codec if protobuf is available" ON)
+
+if(LRD_WITH_PROTOBUF)
+    find_package(Protobuf QUIET MODULE)
+    if(Protobuf_FOUND)
+        message(STATUS "lrd: protobuf ${Protobuf_VERSION} found; ProtobufCodec enabled")
+    else()
+        message(STATUS "lrd: protobuf not found; ProtobufCodec disabled")
+        set(LRD_WITH_PROTOBUF OFF)
+    endif()
+endif()
+
 # Threads::Threads resolves to -pthread. Using the imported target rather than
 # hardcoding -lpthread keeps this correct on toolchains where the flag differs.
 set(THREADS_PREFER_PTHREAD_FLAG ON)
