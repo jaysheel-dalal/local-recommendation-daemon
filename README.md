@@ -22,8 +22,8 @@ milestone.
 | Step | Component | State |
 |-----:|-----------|-------|
 | 0 | Build system, presets, test harness | ✅ done |
-| 1 | RAII fd wrapper, UNIX socket transport, short-read-safe I/O | ⏳ next |
-| 2 | Length-prefixed framing + binary codec | — |
+| 1 | RAII fd wrapper, UNIX socket transport, short-read-safe I/O | ✅ done |
+| 2 | Length-prefixed framing + binary codec | ⏳ next |
 | 3 | LRU cache | — |
 | 4 | Thread pool | — |
 | 5 | Concurrent server | — |
@@ -53,11 +53,29 @@ Four presets are defined:
 | `asan` | AddressSanitizer |
 
 `scripts/build-all.sh` configures and builds all four and runs the suite under
-the checked ones. Everything compiles with `-Wall -Wextra -Wpedantic
+the checked ones. `scripts/demo-echo.sh` runs the step 1 milestone end to end:
+an echo round-trip, an 18 MB payload that forces partial reads and writes, a
+connection refused against a dead socket, and recovery from a stale socket file
+left by a SIGKILLed daemon. Everything compiles with `-Wall -Wextra -Wpedantic
 -Wconversion -Wshadow -Wold-style-cast -Werror`.
 
 Requires only a C++20 compiler, CMake ≥ 3.20 and pthreads. No third-party
 dependencies in Phase 1 — see *Wire format* below for why.
+
+---
+
+## Try it
+
+```bash
+cmake --preset debug && cmake --build --preset debug -j$(nproc)
+
+./build/debug/bin/lrdd --socket /tmp/lrd.sock &
+./build/debug/bin/lrd_cli --socket /tmp/lrd.sock --message "hello"
+
+# 18 MB, split by the kernel across hundreds of reads and writes
+./build/debug/bin/lrd_cli --socket /tmp/lrd.sock \
+    --message "0123456789abcdefgh" --repeat 1000000
+```
 
 ---
 
@@ -82,6 +100,13 @@ a plain `std::mutex`, demonstrates the resulting contention in the benchmark
 keeping `shared_mutex` and switching to an approximate, non-mutating eviction
 policy such as CLOCK — is written up in `docs/concurrency.md` as the road not
 taken.
+
+**Stream sockets have no message boundaries, and the transport layer is built
+around that.** `read()` on a `SOCK_STREAM` socket returns whatever has arrived,
+not what you asked for, so every read goes through `read_exact`, which loops.
+`write_all` is the symmetric case for a full send buffer. Both retry `EINTR`,
+and `write_all` uses `send(MSG_NOSIGNAL)` so a client hanging up mid-write
+surfaces as `EPIPE` rather than killing the daemon with `SIGPIPE`.
 
 **Blocking connection-per-task, not epoll, in Phase 1.** Simpler to reason
 about and to explain. Its real limitation — more concurrent connections than

@@ -7,7 +7,7 @@ rc=0
 for preset in debug release tsan asan; do
   echo "=================== $preset ==================="
   cmake --preset "$preset" >/dev/null 2>&1 || { echo "CONFIGURE FAILED"; rc=1; continue; }
-  if ! cmake --build --preset "$preset" -j"$(nproc)" 2>&1 | grep -E 'error|warning|Error' ; then
+  if ! cmake --build --preset "$preset" -j"$(nproc)" 2>&1 | grep -E 'error:|warning:|Error [0-9]' ; then
     echo "build: clean"
   else
     echo "build: PROBLEMS"; rc=1

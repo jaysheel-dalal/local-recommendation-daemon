@@ -11,3 +11,6 @@ function(lrd_add_test name)
 endfunction()
 
 lrd_add_test(test_version)
+lrd_add_test(test_fd)
+lrd_add_test(test_io)
+lrd_add_test(test_unix_socket)
