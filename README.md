@@ -28,7 +28,9 @@ milestone.
 | 4 | Thread pool | ✅ done |
 | 5 | Concurrent server | ✅ done |
 | 6 | Benchmark client (throughput, p50/p90/p99) | ✅ done |
-| 7 | Sharded cache + contention measurements | ⏳ next |
+| 7 | Sharded cache + contention measurements | ✅ done |
+
+**Phase 1 is complete.**
 
 Phase 2 (candidate ranking, exposure/frequency policy, client SDK, privacy
 noise) begins once step 7 lands.
@@ -103,21 +105,26 @@ Single-threaded p50 is 94 µs against an **88 µs bare-IPC floor** on this host 
 framing, codec, cache and lock together cost ~6 µs. The daemon is not where the
 time goes; the syscalls are.
 
-**The same cache in-process**, no sockets in the way:
+**The cache in-process**, no sockets in the way, 8 threads, by shard count:
 
-| threads | ops/sec | p50 | p99 |
-|--------:|--------:|----:|----:|
-| 1 | 2,772,177 | 200 ns | 700 ns |
-| 8 | 618,791 | 1,600 ns | 160 µs |
+| shards | ops/sec | p99 | hit rate | imbalance |
+|-------:|--------:|----:|---------:|----------:|
+| 1 | 583,516 | 184 µs | 90.8% | 1.00 |
+| 8 | 2,940,006 | 28 µs | 90.8% | 1.00 |
+| 64 | 6,723,146 | 5 µs | 90.6% | 1.00 |
 
-Throughput falls to **22% of single-threaded** and the p99 rises **230×** — a
-textbook mutex convoy.
+One shard is a textbook mutex convoy — throughput *falls* as threads are added.
+Sharding gives **11.5× throughput and a 35× better p99**, costing 0.2 points of
+hit rate to per-shard eviction, with shard imbalance staying at 1.00.
 
-Both tables matter, and that is the finding: the lock is catastrophic in
-isolation and invisible end-to-end, because one IPC round trip is ~300× one
-uncontended cache operation. So the honest prediction for step 7 is that
-sharding will transform the second table and leave the first unchanged — and
-both results get reported.
+**A prediction I got wrong, kept on the record.** Step 6 predicted sharding
+would not move the end-to-end numbers, reasoning that a 300 ns cache operation
+against a 90 µs request makes the lock ~0.3% of the work. Measured: **+43%
+end-to-end throughput at 16 client threads**, reproducible across rounds. The
+error was reasoning from *means* — under contention the single-shard p99 was
+155–247 µs, the same order as an entire request. Contention is a tail
+phenomenon, and comparing mean service times hides it. Full write-up in
+[`docs/benchmarks.md`](docs/benchmarks.md).
 
 ---
 
@@ -143,6 +150,14 @@ plain `std::mutex` (step 5), measures the resulting contention (step 6), then
 shards the cache (step 7). The alternatives — CLOCK, sampled eviction,
 sharding, lock-free — are each written up with their real costs in
 `docs/concurrency.md`.
+
+**Sharding needs the hash mixed first.** `std::hash<int>` in libstdc++ *is the
+identity function*, so masking the low bits of an unmixed hash would put every
+multiple of N in shard 0 — sequential integer keys would pile into a few shards
+and the sharding would achieve nothing while looking correct. Keys go through a
+splitmix64 finalizer before masking, and a test asserts sequential integer keys
+spread evenly. Shard count is a power of two so selection is a mask rather than
+a division.
 
 **Cache values are `shared_ptr<const Value>`.** A reference into the cache would
 dangle once the lock is released or the entry is evicted; returning by value

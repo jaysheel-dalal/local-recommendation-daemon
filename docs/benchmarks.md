@@ -158,3 +158,106 @@ to expose.
 * **Nearest-rank percentiles, not interpolated.** "p99 = 214 us" should mean a
   request really took 214 us, not that two neighbouring samples averaged to it.
 * **`steady_clock`, never `system_clock`**, which can jump backwards under NTP.
+
+---
+
+# Step 7: sharding
+
+The cache is now `ShardedCache` - N independently locked `LockedCache` stripes,
+key assigned by `mix(hash(key)) & (N - 1)`. One shard is exactly the step 5
+design, so the comparison below is like for like.
+
+## Shard count, 8 threads, in process
+
+| shards | ops/sec | p50 ns | p99 ns | p99.9 ns | hit rate | imbalance |
+|-------:|--------:|-------:|-------:|---------:|---------:|----------:|
+| 1 | 583,516 | 1,500 | 184,200 | 610,900 | 90.8% | 1.00 |
+| 2 | 1,155,167 | 1,000 | 98,600 | 354,000 | 90.8% | 1.00 |
+| 4 | 1,893,666 | 800 | 61,000 | 276,000 | 90.8% | 1.00 |
+| 8 | 2,940,006 | 600 | 28,500 | 229,500 | 90.8% | 1.00 |
+| 16 | 4,087,800 | 500 | 15,800 | 210,700 | 90.7% | 1.00 |
+| 32 | 5,469,493 | 500 | 9,600 | 169,600 | 90.7% | 1.00 |
+| 64 | 6,723,146 | 400 | 5,200 | 112,400 | 90.6% | 1.00 |
+
+**11.5x throughput and a 35x better p99**, and the returns had not flattened by
+64 shards. Two columns are there to catch the ways this could have been a hollow
+win:
+
+* **hit rate 90.8% -> 90.6%.** Eviction is per-shard now, so a global LRU's
+  choices are no longer available. At these ratios the cost is 0.2 points -
+  small because the hash spreads keys evenly, which the next column confirms.
+* **imbalance 1.00** throughout (largest shard / mean shard). The splitmix64
+  finalizer is doing its job; a weak hash would show up here as a number well
+  above 1 and a throughput curve that flattened early.
+
+## Threads, 1 shard versus 16
+
+| threads | 1 shard ops/sec | 16 shards ops/sec | change |
+|--------:|----------------:|------------------:|-------:|
+| 1 | 2,646,499 | 2,606,117 | -2% |
+| 2 | 1,783,680 | 3,701,140 | +107% |
+| 4 | 951,303 | 4,434,055 | +366% |
+| 8 | 642,232 | 4,025,949 | +527% |
+| 16 | 717,893 | 3,546,376 | +394% |
+
+The single-shard column *falls* as threads are added - the convoy from step 6.
+The sharded column rises to a plateau around the core count and then declines
+gently, which is what a structure limited by cores rather than by a lock looks
+like. At one thread the two are identical, as they should be: with no
+contention there is nothing for sharding to fix, and the ~2% is noise.
+
+## End to end: the prediction was wrong
+
+Step 6 predicted, on the record, that sharding **would not move the end-to-end
+numbers**. The reasoning: one IPC round trip is ~90 us, one uncontended cache
+operation ~300 ns, so the lock is ~0.3% of a request and invisible.
+
+That prediction was wrong. Measured at 16 client threads, 5 trials per arm, two
+independent rounds with the arms interleaved:
+
+| | round 1 median | round 2 median | observed range |
+|---|---:|---:|---|
+| 1 shard | 119,023 | 123,854 | 96,489-156,697 |
+| 16 shards | 169,466 | 177,042 | 146,598-218,156 |
+
+**About +43% end-to-end throughput**, reproducible across rounds. At low client
+counts (1-4 threads) the two are indistinguishable, as predicted; the gap opens
+only when concurrency is high enough for the lock to be contended.
+
+### Why the prediction failed
+
+The error was reasoning from **means**. Comparing a 300 ns mean cache operation
+against a 90 us mean request makes the lock look irrelevant, and that comparison
+is valid only when the lock is uncontended.
+
+Under contention it is not. The step 6 table shows the single-shard cache's p99
+at 8-16 threads was **155-247 us** - the same order of magnitude as an entire
+request. A request that waits on the lock does not pay 300 ns, it pays
+occasionally more than the rest of the request costs put together. Those waits
+land in the tail, they consume a worker thread while it waits, and at high
+concurrency they cap throughput.
+
+The lesson, stated plainly because it is the most useful thing in this
+document: **contention is a tail phenomenon, and comparing mean service times
+will systematically hide it.** The right comparison was the contended p99
+against the request latency, and that one predicted a real effect.
+
+The headroom argument was also wrong for the same reason. "The cache can do
+670k ops/sec and we only need 143k, therefore 4x headroom" treats a serialising
+resource as if it were a pipe. Queueing theory has the answer: waiting time at a
+serialising resource rises well before utilisation approaches 1, and the
+variance of the service time - which a convoy inflates enormously - drives it.
+
+## Choosing the default
+
+The daemon defaults to **16 shards**. The in-process numbers argue for 32 or 64,
+and the honest reason for not taking them is capacity granularity rather than
+throughput: shards divide the cache evenly, so at the default 10,000 entries, 64
+shards leaves 156 entries each, and a workload whose hot set happens to land
+unevenly would evict more than the aggregate hit rate suggests. 16 shards keeps
+625 entries per shard while capturing most of the available gain (+527% at 8
+threads in process, +43% end to end).
+
+The number is a `--shards` flag precisely because the right value depends on
+core count and cache size, and both are properties of the deployment rather than
+of the code.

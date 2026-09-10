@@ -72,16 +72,42 @@ Pick a shard by `hash(key) % N`. Two threads touching different shards never
 contend, so throughput scales with shard count until it hits the syscall or
 memory bandwidth ceiling.
 
-**Planned for step 7**, after step 6 has measured how much contention there
-actually is. The tradeoffs are worth stating up front:
+**Done in step 7**, after step 6 measured how much contention there actually
+was. Result: 11.5x in-process throughput and a 35x better p99 at 8 threads, and
+- contrary to the prediction on record - about +43% end to end at 16 client
+threads. See `docs/benchmarks.md`, including why the prediction was wrong.
+
+The tradeoffs stated up front, and how each turned out:
 
 * Eviction becomes per-shard, so "least recently used" is now per-shard rather
-  than global. A hot shard evicts entries that a global LRU would have kept.
-  With a decent hash and enough keys this is a small effect; with a skewed key
-  distribution it is not.
-* Global operations (`size()`, `clear()`, a consistent stats snapshot) either
-  take every lock in a fixed order or accept an inconsistent view.
-* More shards means more memory overhead and worse locality per shard.
+  than global. **Measured cost: 0.2 points of hit rate** (90.8% -> 90.6%) going
+  from 1 to 64 shards under a Zipf 0.99 workload. Small because the hash spreads
+  evenly - the benchmark reports shard imbalance alongside, and it stayed at
+  1.00. A weak hash would have shown up there.
+* Global operations (`size()`, `metrics()`) sum across shards while other
+  threads work, so they are approximations. Making them exact would mean holding
+  every lock at once - a pessimisation to make a diagnostic prettier.
+* More shards means more memory overhead and worse locality per shard. This is
+  why the daemon defaults to 16 rather than the 64 that measured fastest: at the
+  default 10,000-entry capacity, 64 shards leaves 156 entries each, and capacity
+  granularity starts to matter more than lock throughput.
+
+### The false-sharing hazard
+
+Each shard is `alignas(64)` so its mutex sits on its own cache line. Without it,
+two mutexes can share a line; locking is a read-modify-write that invalidates
+the line in every other core's cache, so two threads on *different* shards would
+bounce that line between them on every operation. The sharding would look
+correct and deliver a fraction of its benefit.
+
+Honest note: the shards here are whole `LockedCache` objects, well over a cache
+line each and separately heap-allocated, so this alignment is insurance rather
+than a measured win in this layout. It becomes load-bearing the moment per-shard
+state shrinks or the shards move into one contiguous array.
+
+64 is right for x86-64 and most ARM64. Relevant to where this project is aimed:
+**Apple Silicon uses 128-byte cache lines**, so a build targeting an M-series
+machine should raise `kCacheLineSize`.
 
 ### 4. Lock-free
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "lrd/cache/locked_cache.hpp"
+#include "lrd/cache/sharded_cache.hpp"
 #include "lrd/proto/message.hpp"
 
 #include <atomic>
@@ -26,9 +26,9 @@ namespace lrd::daemon {
 ///
 /// Two different mechanisms, for two different reasons:
 ///
-///   * The cache is guarded by a mutex inside LockedCache, because its
-///     operations are compound - find, splice, maybe evict - and have to happen
-///     as a unit.
+///   * The cache is guarded by a mutex per shard inside ShardedCache, because
+///     its operations are compound - find, splice, maybe evict - and have to
+///     happen as a unit.
 ///   * The counters are individual atomics, because each is a standalone
 ///     increment with nothing to keep consistent against anything else. Putting
 ///     them under the cache's mutex would lengthen its critical section for no
@@ -43,9 +43,11 @@ namespace lrd::daemon {
 /// to make a diagnostic prettier.
 class Handler {
 public:
-    /// `capacity` is the maximum number of entries the cache holds before LRU
-    /// eviction begins.
-    explicit Handler(std::size_t capacity) : cache_(capacity) {}
+    /// `capacity` is the total entries held before LRU eviction begins;
+    /// `shard_count` is how many independently locked stripes it is split into
+    /// and must be a power of two. One shard is exactly the step 5 behaviour.
+    Handler(std::size_t capacity, std::size_t shard_count)
+        : cache_(capacity, shard_count) {}
 
     [[nodiscard]] proto::Response handle(const proto::Request& request);
 
@@ -58,7 +60,7 @@ private:
     [[nodiscard]] proto::Response handle_delete(const proto::Request& request);
     [[nodiscard]] proto::Response handle_stats(const proto::Request& request) const;
 
-    cache::LockedCache<std::string, std::string> cache_;
+    cache::ShardedCache<std::string, std::string> cache_;
 
     // relaxed ordering throughout: these are pure counters. Nothing else reads
     // them to decide anything, so there is no happens-before relationship to

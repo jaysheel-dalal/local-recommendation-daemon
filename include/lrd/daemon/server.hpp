@@ -18,6 +18,12 @@ namespace lrd::daemon {
 struct ServerConfig {
     std::string socket_path;
     std::size_t cache_capacity = 10000;
+
+    /// Independently locked stripes of the cache; must be a power of two.
+    /// See docs/benchmarks.md for how this number was chosen rather than
+    /// guessed - and for why it does not move the end-to-end numbers.
+    std::size_t cache_shards = 16;
+
     std::size_t thread_count = 4;
 
     /// Connections accepted but not yet picked up by a worker. Small on

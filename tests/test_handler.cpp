@@ -52,8 +52,12 @@ Request stats_request(std::uint64_t id = 1) {
 /// test_lru_cache, plus the two cases at the end of this file.
 constexpr std::size_t kAmpleCapacity = 128;
 
+/// One shard for the semantics tests: eviction is per-shard, and these cases
+/// are about GET/PUT/DELETE behaviour rather than about striping.
+constexpr std::size_t kShards = 1;
+
 LRD_TEST("get on an empty store misses") {
-    Handler handler(kAmpleCapacity);
+    Handler handler(kAmpleCapacity, kShards);
     const Response response = handler.handle(get("absent"));
     LRD_CHECK(response.type == MessageType::GetResponse);
     LRD_CHECK(response.status == StatusCode::NotFound);
@@ -61,7 +65,7 @@ LRD_TEST("get on an empty store misses") {
 }
 
 LRD_TEST("put then get returns the value") {
-    Handler handler(kAmpleCapacity);
+    Handler handler(kAmpleCapacity, kShards);
     LRD_REQUIRE(handler.handle(put("k", "v")).status == StatusCode::Ok);
 
     const Response response = handler.handle(get("k"));
@@ -70,7 +74,7 @@ LRD_TEST("put then get returns the value") {
 }
 
 LRD_TEST("put overwrites an existing key") {
-    Handler handler(kAmpleCapacity);
+    Handler handler(kAmpleCapacity, kShards);
     (void)handler.handle(put("k", "first"));
     (void)handler.handle(put("k", "second"));
 
@@ -81,7 +85,7 @@ LRD_TEST("an empty value is stored and returned, distinct from a miss") {
     // "" and absent are different answers, and a client needs to tell them
     // apart - which is why GetResponse carries a status alongside the value
     // rather than signalling absence with an empty string.
-    Handler handler(kAmpleCapacity);
+    Handler handler(kAmpleCapacity, kShards);
     LRD_REQUIRE(handler.handle(put("k", "")).status == StatusCode::Ok);
 
     const Response response = handler.handle(get("k"));
@@ -90,14 +94,14 @@ LRD_TEST("an empty value is stored and returned, distinct from a miss") {
 }
 
 LRD_TEST("an empty key is rejected") {
-    Handler handler(kAmpleCapacity);
+    Handler handler(kAmpleCapacity, kShards);
     const Response response = handler.handle(put("", "v"));
     LRD_CHECK(response.type == MessageType::ErrorResponse);
     LRD_CHECK(response.status == StatusCode::InvalidRequest);
 }
 
 LRD_TEST("delete removes a key and reports whether it was there") {
-    Handler handler(kAmpleCapacity);
+    Handler handler(kAmpleCapacity, kShards);
     (void)handler.handle(put("k", "v"));
 
     LRD_CHECK(handler.handle(del("k")).status == StatusCode::Ok);
@@ -109,7 +113,7 @@ LRD_TEST("delete removes a key and reports whether it was there") {
 LRD_TEST("responses echo the request id") {
     // With one request in flight this is only a consistency check; it becomes
     // load bearing in step 5 when responses may complete out of order.
-    Handler handler(kAmpleCapacity);
+    Handler handler(kAmpleCapacity, kShards);
     LRD_CHECK_EQ(handler.handle(get("k", 12345)).request_id, std::uint64_t{12345});
     LRD_CHECK_EQ(handler.handle(put("k", "v", 999)).request_id, std::uint64_t{999});
     LRD_CHECK_EQ(handler.handle(del("k", 7)).request_id, std::uint64_t{7});
@@ -117,7 +121,7 @@ LRD_TEST("responses echo the request id") {
 }
 
 LRD_TEST("stats count hits and misses separately") {
-    Handler handler(kAmpleCapacity);
+    Handler handler(kAmpleCapacity, kShards);
     (void)handler.handle(put("k", "v"));
     (void)handler.handle(get("k"));       // hit
     (void)handler.handle(get("absent"));  // miss
@@ -136,7 +140,7 @@ LRD_TEST("stats count hits and misses separately") {
 }
 
 LRD_TEST("keys with binary content are handled verbatim") {
-    Handler handler(kAmpleCapacity);
+    Handler handler(kAmpleCapacity, kShards);
     const std::string key("a\0b", 3);
     const std::string value("x\0y\0z", 5);
 
@@ -153,7 +157,7 @@ LRD_TEST("keys with binary content are handled verbatim") {
 // --------------------------------------------------------------------------
 
 LRD_TEST("a put that overflows capacity evicts, and the eviction reads as a miss") {
-    Handler handler(2);
+    Handler handler(2, 1);
     (void)handler.handle(put("a", "1"));
     (void)handler.handle(put("b", "2"));
     (void)handler.handle(put("c", "3"));  // evicts "a"
@@ -166,7 +170,7 @@ LRD_TEST("a put that overflows capacity evicts, and the eviction reads as a miss
 }
 
 LRD_TEST("stats report eviction counts and occupancy") {
-    Handler handler(2);
+    Handler handler(2, 1);
     (void)handler.handle(put("a", "1"));
     (void)handler.handle(put("b", "2"));
     (void)handler.handle(put("c", "3"));

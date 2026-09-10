@@ -28,6 +28,7 @@ namespace {
 constexpr std::string_view kDefaultSocketPath = "/tmp/lrd.sock";
 constexpr std::size_t kDefaultCapacity = 10000;
 constexpr std::size_t kDefaultQueue = 64;
+constexpr std::size_t kDefaultShards = 16;
 
 /// hardware_concurrency() may return 0 when it cannot tell, so it always needs
 /// a fallback. Four is a reasonable guess for a device-class machine.
@@ -48,13 +49,14 @@ void print_usage(const char* argv0) {
         "\n"
         "  --socket PATH   unix domain socket to listen on (default: %.*s)\n"
         "  --capacity N    cache entries before LRU eviction (default: %zu)\n"
+        "  --shards N      cache shards, power of two (default: %zu)\n"
         "  --threads N     worker threads (default: one per core)\n"
         "  --queue N       connections queued awaiting a worker (default: %zu)\n"
         "  --verbose       log every request\n"
         "  --version       print version and exit\n"
         "  --help          print this message and exit\n",
         argv0, static_cast<int>(kDefaultSocketPath.size()), kDefaultSocketPath.data(),
-        kDefaultCapacity, kDefaultQueue);
+        kDefaultCapacity, kDefaultShards, kDefaultQueue);
 }
 
 bool parse_size(const char* text, std::size_t& out, const char* name) {
@@ -84,6 +86,10 @@ bool parse_args(int argc, char** argv, Options& out) {
             if (!parse_size(argv[++i], out.config.cache_capacity, "--capacity")) {
                 return false;
             }
+        } else if (arg == "--shards" && i + 1 < argc) {
+            if (!parse_size(argv[++i], out.config.cache_shards, "--shards")) {
+                return false;
+            }
         } else if (arg == "--threads" && i + 1 < argc) {
             if (!parse_size(argv[++i], out.config.thread_count, "--threads")) {
                 return false;
@@ -109,6 +115,7 @@ int main(int argc, char** argv) {
     opts.config.cache_capacity = kDefaultCapacity;
     opts.config.thread_count = default_thread_count();
     opts.config.max_queued_connections = kDefaultQueue;
+    opts.config.cache_shards = kDefaultShards;
 
     if (!parse_args(argc, argv, opts)) {
         print_usage(argv[0]);

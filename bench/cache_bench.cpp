@@ -21,7 +21,7 @@
 #include "latency.hpp"
 #include "workload.hpp"
 
-#include "lrd/cache/locked_cache.hpp"
+#include "lrd/cache/sharded_cache.hpp"
 #include "lrd/common/version.hpp"
 
 #include <algorithm>
@@ -44,7 +44,11 @@ namespace {
 constexpr std::array<std::size_t, 5> kSweepThreads{1, 2, 4, 8, 16};
 
 using namespace lrd::bench;
-using Cache = lrd::cache::LockedCache<std::string, std::string>;
+using Cache = lrd::cache::ShardedCache<std::string, std::string>;
+
+/// Shard counts for --shard-sweep. Powers of two, because that is what the
+/// cache accepts - see the mask-versus-modulo note in sharded_cache.hpp.
+constexpr std::array<std::size_t, 7> kSweepShards{1, 2, 4, 8, 16, 32, 64};
 
 struct Options {
     std::size_t threads = 4;
@@ -55,8 +59,10 @@ struct Options {
     std::size_t value_size = 128;
     double read_ratio = 0.9;
     double zipf_theta = 0.99;
+    std::size_t shards = 1;
     std::size_t trials = 3;  ///< repeats per point; the median is reported
     bool sweep = false;
+    bool shard_sweep = false;
     bool show_help = false;
 };
 
@@ -71,7 +77,9 @@ void print_usage(const char* argv0) {
         "  --value-size N   value bytes (default: 128)\n"
         "  --read-ratio F   fraction of GETs, 0..1 (default: 0.9)\n"
         "  --zipf F         skew; 0 = uniform (default: 0.99)\n"
+        "  --shards N       cache shards, power of two (default: 1)\n"
         "  --trials N       repeats per point, median reported (default: 3)\n"
+        "  --shard-sweep    fixed threads, sweep 1..64 shards\n"
         "  --sweep          run 1,2,4,8,16 threads and print the scaling curve\n"
         "  --help\n",
         argv0);
@@ -122,6 +130,10 @@ bool parse_args(int argc, char** argv, Options& out) {
             if (!parse_double(argv[++i], out.zipf_theta)) return false;
         } else if (arg == "--trials" && has_value) {
             if (!parse_size(argv[++i], out.trials)) return false;
+        } else if (arg == "--shards" && has_value) {
+            if (!parse_size(argv[++i], out.shards)) return false;
+        } else if (arg == "--shard-sweep") {
+            out.shard_sweep = true;
         } else {
             std::fprintf(stderr, "lrd_cache_bench: bad argument '%.*s'\n",
                          static_cast<int>(arg.size()), arg.data());
@@ -135,13 +147,18 @@ struct RunResult {
     LatencySummary latency;
     double ops_per_sec = 0;
     double hit_rate = 0;
+
+    /// Ratio of the largest shard to the mean. 1.0 is perfect balance; a high
+    /// value means the hash is concentrating keys and the sharding is doing
+    /// less than the shard count suggests.
+    double shard_imbalance = 1.0;
 };
 
-RunResult run_once(const Options& opts, std::size_t threads) {
+RunResult run_once(const Options& opts, std::size_t threads, std::size_t shards) {
     const std::vector<std::string> keys = make_keys(opts.key_count);
     const std::string value = make_value(opts.value_size);
 
-    Cache cache(opts.capacity);
+    Cache cache(opts.capacity, shards);
 
     std::vector<LatencySamples> samples;
     samples.reserve(threads);
@@ -222,6 +239,18 @@ RunResult run_once(const Options& opts, std::size_t threads) {
     result.hit_rate = total_reads == 0 ? 0.0
                                        : 100.0 * static_cast<double>(hits.load()) /
                                              static_cast<double>(total_reads);
+
+    const std::vector<std::size_t> sizes = cache.shard_sizes();
+    if (!sizes.empty()) {
+        std::size_t total = 0;
+        std::size_t largest = 0;
+        for (const std::size_t size : sizes) {
+            total += size;
+            largest = std::max(largest, size);
+        }
+        const double mean = static_cast<double>(total) / static_cast<double>(sizes.size());
+        result.shard_imbalance = mean > 0 ? static_cast<double>(largest) / mean : 1.0;
+    }
     return result;
 }
 
@@ -240,21 +269,25 @@ int main(int argc, char** argv) {
 
     std::printf("lrd_cache_bench: %s\n", std::string(lrd::build_info()).c_str());
     std::printf("  in-process, no sockets: isolates the cache mutex\n");
-    std::printf("  keys %zu (zipf %.2f), capacity %zu, value %zu bytes, read ratio %.2f\n\n",
+    std::printf("  keys %zu (zipf %.2f), capacity %zu, value %zu bytes, read ratio %.2f\n",
                 opts.key_count, opts.zipf_theta, opts.capacity, opts.value_size, opts.read_ratio);
 
     // Latencies here are sub-microsecond, so the shared header's microsecond
     // columns would round most of them to 0.0. Nanoseconds instead.
     std::printf("  %zu trials per point; median reported, [min-max] alongside\n\n",
                 opts.trials);
-    std::printf("%8s %12s %10s %10s %10s %10s\n", "threads", "ops/sec", "p50 ns", "p99 ns",
-                "p99.9 ns", "hit rate");
+    if (opts.shard_sweep) {
+        std::printf("  fixed %zu threads; sweeping shard count\n", opts.threads);
+    }
+    std::printf("%8s %12s %10s %10s %10s %10s %9s\n",
+                opts.shard_sweep ? "shards" : "threads", "ops/sec", "p50 ns", "p99 ns", "p99.9 ns",
+                "hit rate", "imbalance");
 
-    const auto measure = [&](std::size_t threads) {
+    const auto measure = [&](std::size_t threads, std::size_t shards, const char* label) {
         std::vector<RunResult> runs;
         runs.reserve(opts.trials);
         for (std::size_t trial = 0; trial < opts.trials; ++trial) {
-            runs.push_back(run_once(opts, threads));
+            runs.push_back(run_once(opts, threads, shards));
         }
 
         double lowest = runs.front().ops_per_sec;
@@ -266,21 +299,29 @@ int main(int argc, char** argv) {
 
         const RunResult& result =
             median_by(runs, [](const RunResult& r) { return r.ops_per_sec; });
-        std::printf("%8zu %12.0f %10.0f %10.0f %10.0f %9.1f%%", threads, result.ops_per_sec,
+        std::printf("%8s %12.0f %10.0f %10.0f %10.0f %9.1f%% %9.2f", label, result.ops_per_sec,
                     result.latency.p50_us * 1000.0, result.latency.p99_us * 1000.0,
-                    result.latency.p999_us * 1000.0, result.hit_rate);
+                    result.latency.p999_us * 1000.0, result.hit_rate, result.shard_imbalance);
         if (opts.trials > 1) {
             std::printf("   [%.0f-%.0f]", lowest, highest);
         }
         std::printf("\n");
     };
 
-    if (opts.sweep) {
+    char label[32];
+    if (opts.shard_sweep) {
+        for (const std::size_t shards : kSweepShards) {
+            std::snprintf(label, sizeof(label), "%zu", shards);
+            measure(opts.threads, shards, label);
+        }
+    } else if (opts.sweep) {
         for (const std::size_t threads : kSweepThreads) {
-            measure(threads);
+            std::snprintf(label, sizeof(label), "%zu", threads);
+            measure(threads, opts.shards, label);
         }
     } else {
-        measure(opts.threads);
+        std::snprintf(label, sizeof(label), "%zu", opts.threads);
+        measure(opts.threads, opts.shards, label);
     }
 
     return 0;

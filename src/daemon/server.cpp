@@ -69,11 +69,11 @@ namespace {
 Server::Server(ServerConfig config)
     : config_(std::move(config)),
       listener_(net::UnixListener::bind(config_.socket_path)),
-      handler_(config_.cache_capacity),
+      handler_(config_.cache_capacity, config_.cache_shards),
       stop_(make_stop_pipe()),
       pool_(config_.thread_count, config_.max_queued_connections) {
-    log_info("codec: {}, cache capacity: {}, worker threads: {}, connection queue: {}",
-             codec_.name(), config_.cache_capacity, config_.thread_count,
+    log_info("codec: {}, cache: {} entries across {} shards, worker threads: {}, queue: {}",
+             codec_.name(), config_.cache_capacity, config_.cache_shards, config_.thread_count,
              config_.max_queued_connections);
 }
 
