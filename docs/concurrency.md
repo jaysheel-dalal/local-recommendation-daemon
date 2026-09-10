@@ -1,7 +1,7 @@
 # Concurrency and locking strategy
 
-Written as steps land. Step 3 (this document's current scope) is the cache
-itself, single-threaded. Steps 4–5 add the thread pool and the locking; step 7
+Written as steps land. Steps 3-4 (this document's current scope) are the cache
+and the thread pool; step 5 adds the locking that connects them, and step 7
 shards the cache and measures the result.
 
 ---
@@ -135,3 +135,97 @@ Deliberately left open until there are measurements to decide with:
   connections is simpler; it starves when concurrent connections outnumber
   worker threads. Step 5 documents whichever it picks along with the failure
   mode it accepts.
+
+---
+
+## The thread pool's locking (step 4)
+
+One `std::mutex` guards exactly two things: the task deque and the `stopping_`
+flag. One `std::condition_variable` signals changes to either. That is the
+entire synchronisation surface, and keeping it that small is deliberate — a pool
+with three mutexes is a pool nobody can reason about.
+
+Two rules do most of the work:
+
+**Tasks never run under the lock.** A worker holds the mutex only long enough to
+pop a task, then releases it and runs the task with nothing held. Running a task
+under the lock would serialise every worker behind it and make the pool an
+elaborate single thread.
+
+**Wait with a predicate, always.**
+
+```cpp
+work_available_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+```
+
+A condition variable can wake with no notify at all (spurious wakeup), and it
+can also be woken legitimately only for another worker to take the only task
+first. Both are ordinary, and both mean the condition must be rechecked in a
+loop. The predicate overload *is* that loop — it is not sugar.
+
+### notify_one versus notify_all
+
+`post()` uses `notify_one`: one new task, one worker needs waking. `shutdown()`
+uses `notify_all`: every worker must observe `stopping_`, and waking one would
+leave the rest asleep forever. That is the general rule — `notify_one` for "one
+more item available", `notify_all` for a state change every waiter must see.
+
+`post()` notifies *after* releasing the mutex. Signalling while holding it means
+the woken thread immediately blocks on the mutex we still hold — "hurry up and
+wait". Modern glibc largely optimises this away with futex requeueing, so the
+honest framing is that this is a small optimisation and not a correctness
+requirement. Both orders are correct.
+
+### Shutdown, and the deadlock that isn't obvious
+
+`shutdown()` sets the flag, optionally clears the queue, notifies everyone, and
+joins. The subtle case is the *constructor*: if spawning the fourth of eight
+threads fails with `EAGAIN`, the three already running are blocked in `wait()`,
+and the `jthread` destructors are about to join them — forever, because nothing
+ever told them to stop. So the constructor catches, sets `stopping_`, notifies,
+and only then rethrows.
+
+`std::jthread` rather than `std::thread` for exactly this reason: its destructor
+joins, so no path out of the pool can leave a worker running against a
+half-destroyed object. We do not use its `stop_token`, because that needs
+`std::condition_variable_any`, which is heavier than `condition_variable` (it
+must support arbitrary lockables and allocates for the stop callback). An
+explicit flag is cheaper and puts the shutdown protocol in the code rather than
+in the library.
+
+One documented restriction: `shutdown()` must not be called from a task running
+on the pool, because a worker would join itself.
+
+### Exceptions
+
+An exception escaping a thread's entry function calls `std::terminate` — the
+whole daemon dies because one request threw. The worker loop catches everything,
+counts it, logs it, and goes straight back for more work. `submit()` is the
+deliberate exception to that: an exception belonging to whoever is waiting on
+the future is delivered through the future rather than swallowed.
+
+### Metrics are deliberately not a consistent snapshot
+
+The four counters are atomics read without a lock, so a concurrent task can land
+between two reads. For reporting that is the right trade — a lock would make
+every stats call contend with the queue. Anything needing exact agreement has to
+stop the pool first, and the test that checks totals does exactly that.
+
+---
+
+## Validating the sanitizer, not just running it
+
+"TSan clean" only means something if TSan would have caught a race in this code
+had one existed. `scripts/verify-tsan.sh` is the negative control: it builds a
+program that posts 2000 tasks incrementing a plain unsynchronised `int` across
+eight workers, and asserts that ThreadSanitizer reports the race. It does:
+
+```
+WARNING: ThreadSanitizer: data race (pid=41268)
+  Read of size 4 at 0x7fffffffe118 by thread T8:
+    #0 operator() race.cpp:7
+    #1 invoke include/lrd/concurrency/task.hpp:95
+```
+
+That is what makes the clean runs on the real suite evidence rather than
+decoration.

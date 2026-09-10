@@ -25,8 +25,8 @@ milestone.
 | 1 | RAII fd wrapper, UNIX socket transport, short-read-safe I/O | ✅ done |
 | 2 | Length-prefixed framing + binary codec | ✅ done |
 | 3 | LRU cache | ✅ done |
-| 4 | Thread pool | ⏳ next |
-| 5 | Concurrent server | — |
+| 4 | Thread pool | ✅ done |
+| 5 | Concurrent server | ⏳ next |
 | 6 | Benchmark client (throughput, p50/p90/p99) | — |
 | 7 | Sharded cache + contention measurements | — |
 
@@ -57,7 +57,9 @@ the checked ones. `scripts/demo-kv.sh` runs the protocol end to end:
 put/get/delete/stats, a 400 KB value, a rejected oversized value, and 2000
 requests down one connection. `scripts/demo-cache.sh` demonstrates LRU
 eviction through the socket, including the case that distinguishes LRU from
-FIFO. Everything compiles with `-Wall -Wextra -Wpedantic
+FIFO. `scripts/verify-tsan.sh` is the negative control for the sanitizer: it
+injects a deliberate data race and confirms ThreadSanitizer reports it, so that
+a clean TSan run is evidence rather than decoration. Everything compiles with `-Wall -Wextra -Wpedantic
 -Wconversion -Wshadow -Wold-style-cast -Werror`.
 
 Requires only a C++20 compiler, CMake ≥ 3.20 and pthreads. No third-party
@@ -123,6 +125,19 @@ payload. That split keeps the allocation-bounding check in one obvious place
 and lets the same codec run over a socket, a file, or a test's `std::vector`.
 A length prefix is an allocation instruction from an untrusted peer, so it is
 validated before anything is resized — see `docs/protocol.md`.
+
+**The task queue is bounded, and the thread pool says so.** An unbounded queue
+turns a producer outrunning its consumers into unbounded memory growth — an OOM
+kill later, far from the cause. `post()` returns `QueueFull` instead, so
+overload becomes a decision the caller makes at the moment it happens. In step 5
+the acceptor's answer will be to close the connection rather than pretend it can
+serve it.
+
+**`Task` is a hand-written move-only callable.** `std::function` requires a
+copy-constructible target, which a lambda capturing a `UnixStream` (owning a
+move-only `Fd`) is not. C++23's `std::move_only_function` solves this properly;
+this build is C++20, verified, so `Task` is the ~40-line stand-in built from a
+concept/model type-erasure pair. Migration to C++23 would be a single `using`.
 
 **Blocking connection-per-task, not epoll, in Phase 1.** Simpler to reason
 about and to explain. Its real limitation — more concurrent connections than
