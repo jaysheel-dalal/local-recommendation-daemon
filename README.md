@@ -23,8 +23,8 @@ milestone.
 |-----:|-----------|-------|
 | 0 | Build system, presets, test harness | ✅ done |
 | 1 | RAII fd wrapper, UNIX socket transport, short-read-safe I/O | ✅ done |
-| 2 | Length-prefixed framing + binary codec | ⏳ next |
-| 3 | LRU cache | — |
+| 2 | Length-prefixed framing + binary codec | ✅ done |
+| 3 | LRU cache | ⏳ next |
 | 4 | Thread pool | — |
 | 5 | Concurrent server | — |
 | 6 | Benchmark client (throughput, p50/p90/p99) | — |
@@ -53,10 +53,9 @@ Four presets are defined:
 | `asan` | AddressSanitizer |
 
 `scripts/build-all.sh` configures and builds all four and runs the suite under
-the checked ones. `scripts/demo-echo.sh` runs the step 1 milestone end to end:
-an echo round-trip, an 18 MB payload that forces partial reads and writes, a
-connection refused against a dead socket, and recovery from a stale socket file
-left by a SIGKILLed daemon. Everything compiles with `-Wall -Wextra -Wpedantic
+the checked ones. `scripts/demo-kv.sh` runs the step 2 milestone end to end:
+put/get/delete/stats, a 400 KB value, a rejected oversized value, and 2000
+requests down one connection. Everything compiles with `-Wall -Wextra -Wpedantic
 -Wconversion -Wshadow -Wold-style-cast -Werror`.
 
 Requires only a C++20 compiler, CMake ≥ 3.20 and pthreads. No third-party
@@ -107,6 +106,13 @@ not what you asked for, so every read goes through `read_exact`, which loops.
 `write_all` is the symmetric case for a full send buffer. Both retry `EINTR`,
 and `write_all` uses `send(MSG_NOSIGNAL)` so a client hanging up mid-write
 surfaces as `EPIPE` rather than killing the daemon with `SIGPIPE`.
+
+**Framing is separate from serialisation.** The framing layer knows only about
+the 4-byte length prefix and the size cap; the codec owns the header and the
+payload. That split keeps the allocation-bounding check in one obvious place
+and lets the same codec run over a socket, a file, or a test's `std::vector`.
+A length prefix is an allocation instruction from an untrusted peer, so it is
+validated before anything is resized — see `docs/protocol.md`.
 
 **Blocking connection-per-task, not epoll, in Phase 1.** Simpler to reason
 about and to explain. Its real limitation — more concurrent connections than

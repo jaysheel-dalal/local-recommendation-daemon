@@ -1,26 +1,27 @@
 // lrdd - Local Recommendation Daemon.
 //
-// Step 1: a single-threaded echo server over a UNIX domain socket. It exists to
-// exercise the transport layer end to end - Fd ownership, bind/listen/accept,
-// partial reads, peer disconnects - before framing (step 2), the cache (step 3)
-// or the thread pool (step 4) are layered on top.
+// Step 2: a framed request/response daemon over a UNIX domain socket. It speaks
+// the protocol in docs/protocol.md - GET, PUT, DELETE, STATS - against an
+// in-memory store.
 //
-// Known limitations, both resolved later and both deliberate for now:
-//   * One connection at a time. Concurrency arrives in steps 4-5.
-//   * No graceful shutdown. Ctrl-C kills the process before the UnixListener
-//     destructor can unlink the socket file, which leaves the file behind -
-//     exactly the stale-socket case that UnixListener::bind detects and cleans
-//     up on the next start. Step 5 adds a self-pipe/signalfd so the accept loop
-//     can be interrupted and shut down cleanly.
+// Known limitations, both deliberate and both scheduled:
+//   * One connection at a time. The thread pool and concurrent server are
+//     steps 4-5.
+//   * The store is an unbounded std::unordered_map, not a cache. LRU eviction
+//     is step 3.
+//   * No graceful shutdown: Ctrl-C kills the process before ~UnixListener can
+//     unlink the socket file, which leaves the stale-socket case that
+//     UnixListener::bind cleans up on the next start. Step 5 adds a self-pipe.
 
 #include "lrd/common/errors.hpp"
 #include "lrd/common/log.hpp"
 #include "lrd/common/version.hpp"
+#include "lrd/daemon/handler.hpp"
 #include "lrd/net/unix_socket.hpp"
+#include "lrd/proto/codec.hpp"
+#include "lrd/proto/framing.hpp"
 
-#include <array>
 #include <cstdio>
-#include <cstdlib>
 #include <exception>
 #include <string>
 #include <string_view>
@@ -41,7 +42,7 @@ void print_usage(const char* argv0) {
         "usage: %s [options]\n"
         "\n"
         "  --socket PATH   unix domain socket to listen on (default: %.*s)\n"
-        "  --verbose       log every chunk transferred\n"
+        "  --verbose       log every request\n"
         "  --version       print version and exit\n"
         "  --help          print this message and exit\n",
         argv0, static_cast<int>(kDefaultSocketPath.size()), kDefaultSocketPath.data());
@@ -71,57 +72,108 @@ bool parse_args(int argc, char** argv, Options& out) {
     return true;
 }
 
-/// Echoes one connection until the peer stops sending.
+/// Can the connection continue after this decode failure?
 ///
-/// Note the shape: read whatever arrived, write all of it back. read_some can
-/// return fewer bytes than the buffer holds and write_all can accept fewer than
-/// offered per syscall, and neither of those is an error - it is just how
-/// stream sockets behave. Step 2 replaces this with framed request/response
-/// handling, where "whatever arrived" stops being good enough and read_exact
-/// takes over.
-void serve_connection(lrd::net::UnixStream& stream, bool verbose) {
-    std::array<unsigned char, 64 * 1024> buffer{};
-    std::size_t total = 0;
+/// The distinction from docs/protocol.md, in code: a *semantic* problem leaves
+/// the stream in a known state, so we answer it and keep serving. A *framing*
+/// problem means we no longer know where the next message begins, and the only
+/// safe response is to hang up. Guessing at a resynchronisation point is how a
+/// protocol parser turns one bad frame into an infinite stream of garbage.
+bool is_recoverable(lrd::proto::DecodeError error) noexcept {
+    switch (error) {
+        case lrd::proto::DecodeError::FieldTooLarge:
+            // The frame itself parsed cleanly - we consumed exactly its bytes -
+            // so the boundary is intact and only the contents were unacceptable.
+            return true;
+
+        case lrd::proto::DecodeError::None:
+        case lrd::proto::DecodeError::Truncated:
+        case lrd::proto::DecodeError::BadMagic:
+        case lrd::proto::DecodeError::UnsupportedVersion:
+        case lrd::proto::DecodeError::ReservedFlags:
+        case lrd::proto::DecodeError::UnknownType:
+        case lrd::proto::DecodeError::WrongDirection:
+        case lrd::proto::DecodeError::TrailingBytes:
+            return false;
+    }
+    return false;
+}
+
+/// Serves framed requests until the peer goes away or the stream breaks.
+void serve_connection(lrd::net::UnixStream& stream, lrd::daemon::Handler& handler,
+                      const lrd::proto::Codec& codec, bool verbose) {
+    // Both buffers live across the whole connection and are reused for every
+    // message. After the first few requests they stop growing, so a connection
+    // serving a million requests does no per-request allocation for framing.
+    lrd::proto::ByteBuffer request_body;
+    lrd::proto::ByteBuffer response_body;
+    std::uint64_t served = 0;
 
     for (;;) {
-        const lrd::net::IoResult in = stream.read_some(buffer.data(), buffer.size());
-        if (in.status == lrd::net::IoStatus::PeerClosed) {
-            lrd::log_info("connection closed by peer after {} bytes", total);
+        const lrd::proto::FrameResult frame = lrd::proto::read_frame(stream, request_body);
+        if (frame.status == lrd::proto::FrameStatus::PeerClosed) {
+            lrd::log_info("connection closed by peer after {} request(s)", served);
             return;
         }
-        if (!in) {
-            lrd::log_warn("read failed: {}", lrd::describe_errno(in.error, "read"));
-            return;
-        }
-
-        const lrd::net::IoResult out = stream.write_all(buffer.data(), in.transferred);
-        if (out.status == lrd::net::IoStatus::PeerClosed) {
-            lrd::log_info("peer hung up mid-write after {} of {} bytes", out.transferred,
-                          in.transferred);
-            return;
-        }
-        if (!out) {
-            lrd::log_warn("write failed: {}", lrd::describe_errno(out.error, "write"));
+        if (!frame) {
+            lrd::log_warn("dropping connection: frame {} (length {})",
+                          lrd::proto::to_string(frame.status), frame.length);
             return;
         }
 
-        total += in.transferred;
+        lrd::proto::Request request;
+        const lrd::proto::DecodeError error = codec.decode(request_body, request);
+
+        if (error != lrd::proto::DecodeError::None) {
+            if (!is_recoverable(error)) {
+                lrd::log_warn("dropping connection: decode {}", lrd::proto::to_string(error));
+                return;
+            }
+            lrd::log_warn("rejecting request {}: decode {}", request.request_id,
+                          lrd::proto::to_string(error));
+            const lrd::proto::Response rejection = lrd::proto::make_error(
+                request.request_id, lrd::proto::StatusCode::InvalidRequest,
+                lrd::proto::to_string(error));
+            if (!lrd::proto::write_message(stream, codec, rejection, response_body)) {
+                return;
+            }
+            continue;
+        }
+
         if (verbose) {
-            lrd::log_debug("echoed {} bytes (total {})", in.transferred, total);
+            lrd::log_debug("#{} {} key='{}' ({} value bytes)", request.request_id,
+                           lrd::proto::to_string(request.type), request.key,
+                           request.value.size());
         }
+
+        const lrd::proto::Response response = handler.handle(request);
+        const lrd::proto::FrameResult written =
+            lrd::proto::write_message(stream, codec, response, response_body);
+        if (!written) {
+            if (written.status != lrd::proto::FrameStatus::PeerClosed) {
+                lrd::log_warn("write failed: frame {}", lrd::proto::to_string(written.status));
+            }
+            return;
+        }
+
+        ++served;
     }
 }
 
 int run(const Options& opts) {
     lrd::net::UnixListener listener = lrd::net::UnixListener::bind(opts.socket_path);
 
+    // One Handler for the whole daemon: the store must outlive individual
+    // connections, or a PUT on one connection would be invisible to a GET on
+    // the next.
+    lrd::daemon::Handler handler;
+    const lrd::proto::BinaryCodec codec;
+    lrd::log_info("codec: {}", codec.name());
+
     for (;;) {
         lrd::net::UnixStream stream = listener.accept();
         lrd::log_info("accepted connection (fd {})", stream.native_handle());
-        serve_connection(stream, opts.verbose);
-        // `stream` goes out of scope here and Fd::close() runs. No explicit
-        // close on any path, including the error returns inside
-        // serve_connection - that is the whole point of the RAII wrapper.
+        serve_connection(stream, handler, codec, opts.verbose);
     }
 }
 
@@ -149,12 +201,6 @@ int main(int argc, char** argv) {
     }
     lrd::log_info("{}", build);
 
-    // One try/catch, at the top. Startup failures (a path that is too long, an
-    // address already in use, a permissions problem) throw from deep inside the
-    // socket code and there is nothing useful to do about them locally - so
-    // they propagate here, become one clear line of output, and set the exit
-    // status. Per-request I/O errors never reach this point; those are returned
-    // as IoResult and handled in serve_connection.
     try {
         return run(opts);
     } catch (const std::exception& e) {

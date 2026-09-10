@@ -1,17 +1,20 @@
-// lrd_cli - step 1 echo client.
+// lrd_cli - command-line client for the daemon.
 //
-// Sends a payload to the daemon and reads exactly the same number of bytes
-// back, verifying they match. With a large --repeat the payload comfortably
-// exceeds the socket buffer, which forces the kernel to split it across many
-// reads and writes - the partial-transfer behaviour that read_exact and
-// write_all exist to absorb. Running with --repeat 1 and --repeat 100000 and
-// getting identical correctness is the point of the exercise.
+//   lrd_cli get KEY
+//   lrd_cli put KEY VALUE
+//   lrd_cli put KEY --size N     generate an N-byte value
+//   lrd_cli del KEY
+//   lrd_cli stats
+//   lrd_cli pipeline N           N put/get pairs down one connection
 //
-// In Phase 2 this directory becomes the client SDK. For now it is a test tool.
+// `pipeline` is the framing test that matters: many messages back to back on a
+// single stream, where a one-byte error in a length prefix desynchronises
+// everything after it.
 
+#include "lrd/client/connection.hpp"
 #include "lrd/common/errors.hpp"
 #include "lrd/common/log.hpp"
-#include "lrd/net/unix_socket.hpp"
+#include "lrd/proto/message.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -19,147 +22,194 @@
 #include <exception>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
 
 namespace {
 
-constexpr std::string_view kDefaultSocketPath = "/tmp/lrd.sock";
+using lrd::client::CallStatus;
+using lrd::client::Connection;
 
-struct Options {
-    std::string socket_path{kDefaultSocketPath};
-    std::string message{"hello from lrd_cli"};
-    std::size_t repeat = 1;
-    bool show_help = false;
-};
+constexpr std::string_view kDefaultSocketPath = "/tmp/lrd.sock";
 
 void print_usage(const char* argv0) {
     std::printf(
-        "usage: %s [options]\n"
+        "usage: %s [--socket PATH] COMMAND [args]\n"
         "\n"
-        "  --socket PATH   daemon socket (default: %.*s)\n"
-        "  --message TEXT  payload to echo\n"
-        "  --repeat N      repeat the payload N times (use a big N to force\n"
-        "                  partial reads/writes)\n"
-        "  --help          print this message and exit\n",
+        "  get KEY               fetch a value\n"
+        "  put KEY VALUE         store a value\n"
+        "  put KEY --size N      store a generated N-byte value\n"
+        "  del KEY               delete a key\n"
+        "  stats                 daemon counters\n"
+        "  pipeline N            N put/get pairs on one connection\n"
+        "\n"
+        "  --socket PATH         daemon socket (default: %.*s)\n",
         argv0, static_cast<int>(kDefaultSocketPath.size()), kDefaultSocketPath.data());
 }
 
-bool parse_args(int argc, char** argv, Options& out) {
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view arg = argv[i];
-        if (arg == "--help" || arg == "-h") {
-            out.show_help = true;
-        } else if (arg == "--socket" && i + 1 < argc) {
-            out.socket_path = argv[++i];
-        } else if (arg == "--message" && i + 1 < argc) {
-            out.message = argv[++i];
-        } else if (arg == "--repeat" && i + 1 < argc) {
-            out.repeat = std::strtoul(argv[++i], nullptr, 10);
-            if (out.repeat == 0) {
-                std::fprintf(stderr, "lrd_cli: --repeat must be >= 1\n");
-                return false;
-            }
-        } else {
-            std::fprintf(stderr, "lrd_cli: bad argument '%.*s'\n", static_cast<int>(arg.size()),
-                         arg.data());
-            return false;
-        }
+std::string generate_value(std::size_t size) {
+    std::string value(size, '\0');
+    for (std::size_t i = 0; i < size; ++i) {
+        value[i] = static_cast<char>('a' + (i % 26));
     }
-    return true;
+    return value;
 }
 
-int run(const Options& opts) {
-    std::string payload;
-    payload.reserve(opts.message.size() * opts.repeat);
-    for (std::size_t i = 0; i < opts.repeat; ++i) {
-        payload += opts.message;
+int report(CallStatus status, const Connection& connection, std::string_view what) {
+    if (status == CallStatus::Ok) {
+        return 0;
+    }
+    if (status == CallStatus::NotFound) {
+        lrd::log_info("{}: not found", what);
+        return 1;
+    }
+    lrd::log_error("{}: {} ({})", what, lrd::client::to_string(status), connection.last_error());
+    return 1;
+}
+
+int cmd_get(Connection& connection, std::string_view key) {
+    std::string value;
+    const CallStatus status = connection.get(key, value);
+    if (status == CallStatus::Ok) {
+        // Value to stdout, diagnostics to stderr, so the tool composes in a
+        // shell pipeline.
+        std::printf("%.*s\n", static_cast<int>(value.size()), value.data());
+    }
+    return report(status, connection, "get");
+}
+
+int cmd_put(Connection& connection, std::string_view key, std::string_view value) {
+    const CallStatus status = connection.put(key, value);
+    if (status == CallStatus::Ok) {
+        lrd::log_info("put '{}' ({} bytes)", key, value.size());
+    }
+    return report(status, connection, "put");
+}
+
+int cmd_delete(Connection& connection, std::string_view key) {
+    const CallStatus status = connection.remove(key);
+    if (status == CallStatus::Ok) {
+        lrd::log_info("deleted '{}'", key);
+    }
+    return report(status, connection, "del");
+}
+
+int cmd_stats(Connection& connection) {
+    lrd::proto::Stats stats;
+    const CallStatus status = connection.fetch_stats(stats);
+    if (status != CallStatus::Ok) {
+        return report(status, connection, "stats");
     }
 
-    lrd::net::UnixStream stream = lrd::net::UnixStream::connect(opts.socket_path);
+    std::printf("requests %llu\ngets     %llu\nputs     %llu\ndeletes  %llu\nhits     %llu\nmisses   %llu\n",
+                static_cast<unsigned long long>(stats.requests),
+                static_cast<unsigned long long>(stats.gets),
+                static_cast<unsigned long long>(stats.puts),
+                static_cast<unsigned long long>(stats.deletes),
+                static_cast<unsigned long long>(stats.hits),
+                static_cast<unsigned long long>(stats.misses));
+    return 0;
+}
 
+/// Many small messages down one connection, verifying every value comes back
+/// intact. This is what catches an off-by-one in the length prefix: the first
+/// request would succeed and everything after it would be read from the wrong
+/// offset.
+int cmd_pipeline(Connection& connection, std::size_t count) {
     const auto started = std::chrono::steady_clock::now();
+    std::size_t mismatches = 0;
 
-    // Send and receive must overlap. Writing the whole payload first and only
-    // then reading the reply deadlocks the moment the payload outgrows the
-    // socket buffers, and it is worth being precise about why:
-    //
-    //   client blocks in write_all, its send buffer full
-    //     -> the daemon echoes what it has read, filling its own send buffer
-    //        and the client's receive buffer, and blocks in write_all too
-    //          -> nobody is left to drain either direction. Both sides wait
-    //             forever.
-    //
-    // Roughly 200 KB of kernel buffering hides this: it works perfectly in
-    // testing and hangs on the first large request in production. The fix is to
-    // drain the reply on one thread while the other fills the pipe.
-    //
-    // This is also the structural reason real protocols frame their messages
-    // and bound their sizes - which is exactly what step 2 adds. A
-    // request/response protocol with small messages never reaches this state,
-    // and that is a design property, not luck.
-    lrd::net::IoResult sent;
-    std::thread sender([&] { sent = stream.write_all(payload.data(), payload.size()); });
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::string key = "key-" + std::to_string(i);
+        const std::string expected = "value-" + std::to_string(i * 7919);
 
-    // Reading back *exactly* payload.size() bytes is the assertion. A naive
-    // client would issue one read(), get a fraction of the payload, and either
-    // report corruption or hang waiting for a message boundary that a stream
-    // socket never provides.
-    std::vector<char> echoed(payload.size());
-    const lrd::net::IoResult received = stream.read_exact(echoed.data(), echoed.size());
-    sender.join();
+        if (const CallStatus status = connection.put(key, expected); status != CallStatus::Ok) {
+            return report(status, connection, "pipeline put");
+        }
+
+        std::string actual;
+        if (const CallStatus status = connection.get(key, actual); status != CallStatus::Ok) {
+            return report(status, connection, "pipeline get");
+        }
+        if (actual != expected) {
+            ++mismatches;
+        }
+    }
+
     const auto elapsed = std::chrono::steady_clock::now() - started;
-
-    if (!sent) {
-        lrd::log_error("send failed after {} bytes: {}", sent.transferred,
-                       lrd::describe_errno(sent.error, "write"));
-        return 1;
-    }
-
-    if (received.status == lrd::net::IoStatus::PeerClosed) {
-        lrd::log_error("daemon closed after {} of {} bytes", received.transferred, payload.size());
-        return 1;
-    }
-    if (!received) {
-        lrd::log_error("read failed: {}", lrd::describe_errno(received.error, "read"));
-        return 1;
-    }
-
-    const bool matches = std::string_view(echoed.data(), echoed.size()) == payload;
     const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+    const double per_request = count == 0 ? 0.0 : static_cast<double>(micros) / (2.0 * static_cast<double>(count));
 
-    lrd::log_info("echoed {} bytes in {} us, payload {}", payload.size(), micros,
-                  matches ? "matches" : "DIFFERS");
-
-    if (payload.size() <= 256) {
-        std::printf("%.*s\n", static_cast<int>(echoed.size()), echoed.data());
-    }
-
-    return matches ? 0 : 1;
+    lrd::log_info("{} put/get pairs in {} us ({:.2f} us per request), {} mismatch(es)", count,
+                  micros, per_request, mismatches);
+    return mismatches == 0 ? 0 : 1;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    Options opts;
-    if (!parse_args(argc, argv, opts)) {
+    std::string socket_path{kDefaultSocketPath};
+    std::vector<std::string_view> args;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            return 0;
+        }
+        if (arg == "--socket") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "lrd_cli: --socket requires a path\n");
+                return 2;
+            }
+            socket_path = argv[++i];
+            continue;
+        }
+        args.push_back(arg);
+    }
+
+    if (args.empty()) {
         print_usage(argv[0]);
         return 2;
     }
-    if (opts.show_help) {
-        print_usage(argv[0]);
-        return 0;
-    }
 
     try {
-        return run(opts);
+        Connection connection = Connection::connect(socket_path);
+        const std::string_view command = args[0];
+
+        if (command == "get" && args.size() == 2) {
+            return cmd_get(connection, args[1]);
+        }
+        if (command == "put" && args.size() == 3) {
+            if (args[1].empty()) {
+                std::fprintf(stderr, "lrd_cli: key must not be empty\n");
+                return 2;
+            }
+            return cmd_put(connection, args[1], args[2]);
+        }
+        if (command == "put" && args.size() == 4 && args[2] == "--size") {
+            // std::string first: a string_view is not guaranteed
+            // NUL-terminated, and strtoull reads until one.
+            const auto size = static_cast<std::size_t>(std::stoull(std::string(args[3])));
+            return cmd_put(connection, args[1], generate_value(size));
+        }
+        if (command == "del" && args.size() == 2) {
+            return cmd_delete(connection, args[1]);
+        }
+        if (command == "stats" && args.size() == 1) {
+            return cmd_stats(connection);
+        }
+        if (command == "pipeline" && args.size() == 2) {
+            const auto count = static_cast<std::size_t>(std::stoull(std::string(args[1])));
+            return cmd_pipeline(connection, count);
+        }
+
+        std::fprintf(stderr, "lrd_cli: unrecognised command\n");
+        print_usage(argv[0]);
+        return 2;
     } catch (const lrd::SystemError& e) {
-        // Worth distinguishing: "nothing is listening" is the overwhelmingly
-        // common failure for a client and deserves an actionable message rather
-        // than a raw errno string.
         if (e.code() == std::errc::connection_refused ||
             e.code() == std::errc::no_such_file_or_directory) {
-            lrd::log_error("no daemon listening on {} - start lrdd first", opts.socket_path);
+            lrd::log_error("no daemon listening on {} - start lrdd first", socket_path);
             return 1;
         }
         lrd::log_error("fatal: {}", e.what());
