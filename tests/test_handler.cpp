@@ -1,5 +1,6 @@
 #include "lrd/daemon/handler.hpp"
 #include "lrd/policy/policy.hpp"
+#include "lrd/privacy/noise.hpp"
 
 #include "test_harness.hpp"
 
@@ -33,8 +34,9 @@ rank::Timestamp fixed_now() {
 /// caller - Handler is neither copyable nor movable (it owns a ShardedCache and
 /// atomics), so anything needing a move here would not compile.
 Handler make_handler(std::size_t capacity = kCapacity, std::size_t shards = kShards,
-                     lrd::policy::PolicyConfig policy = {}) {
-    return Handler(capacity, shards, lrd::rank::ScoringConfig{}, policy, &fixed_now);
+                     lrd::policy::PolicyConfig policy = {},
+                     lrd::privacy::PrivacyConfig privacy = {}) {
+    return Handler(capacity, shards, lrd::rank::ScoringConfig{}, policy, privacy, &fixed_now);
 }
 
 rank::Item item_of(rank::ItemId id, std::string category, double score,

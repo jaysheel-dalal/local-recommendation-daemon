@@ -21,9 +21,11 @@ rank::Timestamp wall_clock_now() {
 }  // namespace
 
 Handler::Handler(std::size_t capacity, std::size_t shard_count, rank::ScoringConfig scoring,
-                 policy::PolicyConfig policy, rank::Timestamp (*clock)())
+                 policy::PolicyConfig policy, privacy::PrivacyConfig privacy,
+                 rank::Timestamp (*clock)())
     : cache_(capacity, shard_count),
       policy_(policy, shard_count),
+      privacy_(privacy),
       scoring_(std::move(scoring)),
       clock_(clock != nullptr ? clock : &wall_clock_now) {}
 
@@ -171,8 +173,56 @@ proto::Stats Handler::stats() const {
     return stats;
 }
 
+proto::Stats Handler::published_stats() const {
+    const proto::Stats exact = stats();
+    const rank::Timestamp now = clock_();
+
+    proto::Stats out = exact;
+
+    // Which counters are noised, and which are not.
+    //
+    // The split is by *what the number is derived from*, not by how sensitive it
+    // feels. A counter that moves because the person using this device did
+    // something is behavioural and gets noise. A counter that describes the
+    // catalogue or the configuration says nothing about them and stays exact -
+    // adding noise there would cost accuracy and buy no privacy at all.
+    const auto noise = [&](const char* name, std::uint64_t value) {
+        return privacy_.publish(name, value, now);
+    };
+
+    // Behavioural: every one of these increments because a request was made.
+    out.requests = noise("requests", exact.requests);
+    out.gets = noise("gets", exact.gets);
+    out.recommends = noise("recommends", exact.recommends);
+    out.hits = noise("hits", exact.hits);
+    out.misses = noise("misses", exact.misses);
+    out.policy_allowed = noise("policy_allowed", exact.policy_allowed);
+    out.policy_exposure_blocked = noise("policy_exposure_blocked", exact.policy_exposure_blocked);
+    out.policy_frequency_blocked =
+        noise("policy_frequency_blocked", exact.policy_frequency_blocked);
+
+    // Catalogue management, not user behaviour: puts and deletes are what an
+    // advertiser or a content pipeline did, and evictions follow from them.
+    // Left exact.
+    //
+    //   out.puts, out.deletes, out.evictions, out.entries, out.capacity,
+    //   out.policy_tracked
+    //
+    // policy_store_full is deliberately exact for a different reason: it is an
+    // operational alarm. A noised alarm that reads zero when the store is
+    // genuinely full is worse than a small leak about capacity pressure, and the
+    // quantity it leaks is about the daemon rather than about a person.
+    //
+    // One consequence worth naming: the noised counters no longer add up.
+    // `requests` is noised independently of its components, so it will not equal
+    // their sum. Forcing consistency would mean deriving one from the others,
+    // and that correlation is itself a channel - two noisy values that must sum
+    // to a third leak more than three independent ones.
+    return out;
+}
+
 ResponseBody Handler::on_stats() const {
-    return proto::StatsResult{StatusCode::Ok, stats()};
+    return proto::StatsResult{StatusCode::Ok, published_stats()};
 }
 
 }  // namespace lrd::daemon

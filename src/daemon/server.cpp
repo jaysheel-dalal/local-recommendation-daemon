@@ -70,7 +70,8 @@ namespace {
 Server::Server(ServerConfig config)
     : config_(std::move(config)),
       listener_(net::UnixListener::bind(config_.socket_path)),
-      handler_(config_.cache_capacity, config_.cache_shards, config_.scoring, config_.policy),
+      handler_(config_.cache_capacity, config_.cache_shards, config_.scoring, config_.policy,
+               config_.privacy),
       codec_(proto::make_codec(config_.codec_name)),
       stop_(make_stop_pipe()),
       pool_(config_.thread_count, config_.max_queued_connections) {
@@ -81,6 +82,19 @@ Server::Server(ServerConfig config)
     log_info("codec: {}, cache: {} entries across {} shards, worker threads: {}, queue: {}",
              codec_->name(), config_.cache_capacity, config_.cache_shards, config_.thread_count,
              config_.max_queued_connections);
+
+    if (config_.privacy.enabled) {
+        // Logged so a reader of the numbers knows they are noised, and with what
+        // parameters. An exported metric whose provenance is undocumented
+        // invites someone downstream to treat it as exact.
+        log_info("privacy: exported metrics noised (epsilon {}, sensitivity {}, epoch {}s, "
+                 "suppress <= {}, round to {})",
+                 config_.privacy.epsilon, config_.privacy.sensitivity,
+                 config_.privacy.epoch.count() / 1000, config_.privacy.suppression_threshold,
+                 config_.privacy.rounding);
+    } else {
+        log_info("privacy: disabled, exported metrics are exact");
+    }
 }
 
 Server::~Server() {

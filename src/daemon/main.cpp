@@ -60,6 +60,12 @@ void print_usage(const char* argv0) {
         "  --frequency-window S window length in seconds (default: 3600)\n"
         "  --policy-capacity N  items tracked for compliance (default: 100000)\n"
         "  --policy-fail-open   evict counters when full instead of refusing\n"
+        "  --privacy            add noise to exported metrics\n"
+        "  --privacy-epsilon F  smaller = more noise (default: 1.0)\n"
+        "  --privacy-epoch S    seconds one noise draw is reused (default: 3600)\n"
+        "  --privacy-round N    round published values to a multiple (default: 10)\n"
+        "  --privacy-suppress N publish 0 for noisy values at or below N (default: 5)\n"
+        "  --privacy-seed N     fixed seed, for reproducible output\n"
         "  --verbose       log every request\n"
         "  --version       print version and exit\n"
         "  --help          print this message and exit\n",
@@ -113,6 +119,41 @@ bool parse_args(int argc, char** argv, Options& out) {
             out.config.codec_name = argv[++i];
         } else if (arg == "--policy-fail-open") {
             out.config.policy.fail_open_when_full = true;
+        } else if (arg == "--privacy") {
+            out.config.privacy.enabled = true;
+        } else if (arg == "--privacy-epsilon" && i + 1 < argc) {
+            char* end = nullptr;
+            const char* text = argv[++i];
+            out.config.privacy.epsilon = std::strtod(text, &end);
+            if (end == text || *end != '\0' || out.config.privacy.epsilon <= 0.0) {
+                std::fprintf(stderr, "lrdd: --privacy-epsilon must be positive\n");
+                return false;
+            }
+        } else if (arg == "--privacy-epoch" && i + 1 < argc) {
+            std::size_t seconds = 0;
+            if (!parse_size(argv[++i], seconds, "--privacy-epoch")) {
+                return false;
+            }
+            out.config.privacy.epoch = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::seconds{static_cast<long>(seconds)});
+        } else if (arg == "--privacy-round" && i + 1 < argc) {
+            std::size_t rounding = 0;
+            if (!parse_size(argv[++i], rounding, "--privacy-round")) {
+                return false;
+            }
+            out.config.privacy.rounding = static_cast<std::uint64_t>(rounding);
+        } else if (arg == "--privacy-suppress" && i + 1 < argc) {
+            std::size_t threshold = 0;
+            if (!parse_size_allow_zero(argv[++i], threshold, "--privacy-suppress")) {
+                return false;
+            }
+            out.config.privacy.suppression_threshold = static_cast<std::uint64_t>(threshold);
+        } else if (arg == "--privacy-seed" && i + 1 < argc) {
+            std::size_t seed = 0;
+            if (!parse_size_allow_zero(argv[++i], seed, "--privacy-seed")) {
+                return false;
+            }
+            out.config.privacy.seed = static_cast<std::uint64_t>(seed);
         } else if (arg == "--exposure-cap" && i + 1 < argc) {
             std::size_t cap = 0;
             // Zero is a meaningful value here ("unlimited"), so parse_size -

@@ -2,6 +2,7 @@
 
 #include "lrd/cache/sharded_cache.hpp"
 #include "lrd/policy/exposure_store.hpp"
+#include "lrd/privacy/noise.hpp"
 #include "lrd/proto/message.hpp"
 #include "lrd/rank/item.hpp"
 #include "lrd/rank/scorer.hpp"
@@ -49,11 +50,22 @@ public:
     /// to return one. A function pointer rather than std::function because the
     /// clock is called once per recommendation and carries no state.
     Handler(std::size_t capacity, std::size_t shard_count, rank::ScoringConfig scoring = {},
-            policy::PolicyConfig policy = {}, rank::Timestamp (*clock)() = nullptr);
+            policy::PolicyConfig policy = {}, privacy::PrivacyConfig privacy = {},
+            rank::Timestamp (*clock)() = nullptr);
 
     [[nodiscard]] proto::Response handle(const proto::Request& request);
 
+    /// The daemon's own counters, exact.
+    ///
+    /// Never leaves the process when privacy is enabled - see
+    /// published_stats(). Kept for in-process diagnostics, because an operator
+    /// chasing a hit-rate problem needs the real number and noise applied to the
+    /// source would destroy that.
     [[nodiscard]] proto::Stats stats() const;
+
+    /// The counters as they go on the wire: noised where the value derives from
+    /// user activity, exact where it does not.
+    [[nodiscard]] proto::Stats published_stats() const;
 
 private:
     [[nodiscard]] proto::ResponseBody on_get(const proto::GetItem& request);
@@ -69,6 +81,9 @@ private:
     /// corresponding shards, which keeps the two lock domains parallel even
     /// though they are never held at the same time.
     policy::ExposureStore policy_;
+
+    /// Applied only on the way out. Stateless and thread-safe.
+    privacy::NoisyCounters privacy_;
 
     rank::ScoringConfig scoring_;
     rank::Timestamp (*clock_)() = nullptr;

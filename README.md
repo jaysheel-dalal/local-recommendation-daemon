@@ -50,10 +50,9 @@ milestone.
 | 9 | Item metadata + candidate ranking | ✅ done |
 | 10 | Compliance: exposure cap, frequency limit | ✅ done |
 | 11 | Client SDK | ✅ done |
-| 12 | Privacy: noise on exported metrics | ⏳ next |
+| 12 | Privacy: noise on exported metrics | ✅ done |
 
-Phase 2 (candidate ranking, exposure/frequency policy, client SDK, privacy
-noise) begins once step 7 lands.
+**Phase 2 complete.**
 
 ---
 
@@ -81,7 +80,10 @@ requests down one connection. `scripts/demo-cache.sh` demonstrates LRU
 eviction through the socket, including the case that distinguishes LRU from
 FIFO. `scripts/demo-concurrent.sh` runs eight
 clients at once against the threaded daemon and then stops it with SIGTERM,
-checking the socket file is cleaned up. `scripts/verify-tsan.sh` is the negative
+checking the socket file is cleaned up. `scripts/demo-privacy.sh` shows the exported
+counters with privacy off and on, then runs the averaging attack against them —
+twelve reads of the same counter returning the same number twelve times.
+`scripts/verify-tsan.sh` is the negative
 control for the sanitizer: it injects a deliberate data race and confirms
 ThreadSanitizer reports it, so that a clean TSan run is evidence rather than
 decoration. Everything compiles with `-Wall -Wextra -Wpedantic
@@ -232,6 +234,31 @@ than the response silently shrinking by one), and only items actually returned
 are charged an exposure — not every candidate that was scored. Full reasoning in
 [`docs/policy.md`](docs/policy.md).
 
+**Exported metrics are noised; the daemon's own counters are not.** With
+`--privacy`, `Stats` leaves the process as
+`suppress(round(clamp(exact + Laplace(0, sensitivity/epsilon))))`. Three details
+are the difference between a mechanism and a gesture. **The guarantee is
+event-level, not user-level** — on a single-user device this person's
+contribution to a counter *is* the counter, so bounding that would mean
+publishing nothing; what the noise buys is that no *individual event* can be
+confirmed. **The draw is memoised per (metric, epoch)**, so polling the endpoint
+1000 times returns the same number 1000 times — fresh noise per read would
+average away to the truth and protect nothing while looking identical. It is a
+hash of (seed, metric, epoch) rather than a cache, so it needs no lock, no
+eviction, and survives a restart within the epoch. **And suppression tests the
+noisy value, never the exact one**: suppressing on the true count would leak
+precisely what the noise hides.
+
+Which counters get noise is decided by what they derive from. `requests`, `gets`,
+`hits` and the policy decisions are behavioural. `puts`, `evictions` and
+`capacity` describe the catalogue and the configuration, so noising them would
+cost accuracy and buy no privacy. A consequence stated rather than papered over:
+**the noised counters no longer sum consistently**, and forcing them to would
+itself be a leak. The mechanism's real limits — `mt19937` is not a CSPRNG, naive
+floating-point Laplace leaks through its low bits (Mironov 2012), and N epochs of
+observation is N×ε — are written down in
+[`docs/privacy.md`](docs/privacy.md) rather than left for a reviewer to find.
+
 **The frequency window is a sliding-window counter**, not a fixed bucket. A fixed
 bucket allows 2× the limit across a boundary — four shows at 10:59 and four more
 at 11:01 all pass. Keeping the previous window's count and weighting it by how
@@ -336,6 +363,6 @@ src/             implementation, mirroring include/
 bench/           load generator and latency reporter
 tests/           dependency-free harness + CTest entries
 examples/        an app consuming the SDK and nothing else
-docs/            protocol, concurrency, benchmarks, ranking, policy, sdk
+docs/            protocol, concurrency, benchmarks, ranking, policy, sdk, privacy
 scripts/         build and smoke helpers
 ```

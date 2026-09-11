@@ -5,6 +5,7 @@
 #include "lrd/daemon/connection_registry.hpp"
 #include "lrd/daemon/handler.hpp"
 #include "lrd/policy/policy.hpp"
+#include "lrd/privacy/noise.hpp"
 #include "lrd/rank/scorer.hpp"
 #include "lrd/net/unix_socket.hpp"
 #include "lrd/proto/codec.hpp"
@@ -45,6 +46,9 @@ struct ServerConfig {
 
     /// Compliance limits. See docs/policy.md.
     policy::PolicyConfig policy;
+
+    /// Noise applied to exported metrics. See docs/privacy.md.
+    privacy::PrivacyConfig privacy;
 
     bool verbose = false;
 };
