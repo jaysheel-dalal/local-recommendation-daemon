@@ -142,6 +142,24 @@ public:
         return total;
     }
 
+    /// Copies one shard's entries into `out` (cleared first).
+    ///
+    /// Deliberately per-shard rather than a whole-cache snapshot. A single
+    /// snapshot would hold one lock at a time anyway but would allocate a vector
+    /// the size of the entire cache; iterating shard by shard bounds that by the
+    /// largest shard and lets the caller process each batch before taking the
+    /// next lock.
+    ///
+    /// The consequence, worth stating: this is **not** a consistent view. Shards
+    /// are read at different instants, so an item moved between shards - which
+    /// cannot happen, since the shard is a function of the key - or written
+    /// during the scan may be seen or missed. For ranking that is fine: a
+    /// candidate set a few milliseconds stale is not a correctness problem, and
+    /// the alternative is holding every lock at once.
+    void snapshot_shard(std::size_t index, std::vector<std::pair<Key, ValuePtr>>& out) const {
+        shards_[index]->cache.snapshot(out);
+    }
+
     /// Entry count per shard. Exposed for tests and diagnostics: an unbalanced
     /// distribution is the failure mode that makes sharding useless, and it is
     /// invisible in any aggregate number.

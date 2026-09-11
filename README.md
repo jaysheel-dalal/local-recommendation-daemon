@@ -1,13 +1,25 @@
 # lrd — Local Recommendation Daemon
 
-An on-device caching and ranking daemon written in C++20. Client processes talk
-to it over a UNIX domain socket; a thread pool serves requests against a shared
-in-memory cache guarded by an explicit locking strategy.
+An on-device recommendation daemon written in C++20. Client processes talk to it
+over a UNIX domain socket; a thread pool serves requests against a sharded
+in-memory item store guarded by an explicit locking strategy.
 
-The project models the shape of an on-device ad-candidate delivery system:
-local signals stay local, ranking and policy enforcement happen in a background
-daemon, and applications reach it through a thin client SDK rather than through
-raw socket calls.
+It models the shape of an on-device ad-candidate delivery system: a background
+daemon holds candidate items, ranks them against a **local user signal**, and
+returns a slate. The signal is a handful of category weights — no history, no
+identifiers, no item ids the user has seen. Raw activity has no path to the
+daemon at all, which is the substance behind "privacy by architecture" rather
+than a label on it.
+
+```
+$ lrd_cli recommend --signal tech=1.0,sport=0.3 --count 5
+rank           id category         advertiser     score
+1              19 tech             initech        0.882004
+2              37 tech             acme           0.366338
+3              20 sport            umbrella       0.277381
+4              38 sport            globex         0.115887
+5              79 tech             initech        0.051644
+```
 
 Built and tested on Ubuntu (WSL2), x86-64, GCC 15.2, C++20.
 
@@ -35,8 +47,8 @@ milestone.
 | Step | Component | State |
 |-----:|-----------|-------|
 | 8 | ProtobufCodec behind the Phase 1 seam, benchmarked | ✅ done |
-| 9 | Item metadata + candidate ranking | ⏳ next |
-| 10 | Compliance: exposure cap, frequency limit | — |
+| 9 | Item metadata + candidate ranking | ✅ done |
+| 10 | Compliance: exposure cap, frequency limit | ⏳ next |
 | 11 | Client SDK | — |
 | 12 | Privacy: noise on exported metrics | — |
 
@@ -174,6 +186,31 @@ plain `std::mutex` (step 5), measures the resulting contention (step 6), then
 shards the cache (step 7). The alternatives — CLOCK, sampled eviction,
 sharding, lock-free — are each written up with their real costs in
 `docs/concurrency.md`.
+
+**Ranking is two-stage, because diversity cannot be sorted for.** The penalty for
+repeating a category depends on what has *already been picked*, so it cannot be
+precomputed. Retrieval scores every candidate independently and keeps the best
+`k × 4` in a bounded min-heap (O(n log m), O(m) memory); re-ranking runs the
+order-dependent diversity logic over only that shortlist. Same shape as a real
+ranking pipeline, for the same reason. Full write-up in
+[`docs/ranking.md`](docs/ranking.md).
+
+**A recommendation scan must not touch recency.** Ranking visits every item; doing
+that through `get()` would mark the whole cache most-recently-used on every
+request, and eviction would become effectively random — the cache would keep
+working and quietly stop being a cache. The scan is `const`, goes shard by shard,
+and holds each lock only long enough to copy out refcounted pointers. A test pins
+it: after a full scan, the item that was least recently used *before* the scan
+must still be the one evicted.
+
+**`std::variant` for messages, having rejected it in v1.** Step 2 used a tagged
+struct and said so explicitly — with four types sharing two fields, `std::visit`
+cost more clarity than it bought, "worth revisiting when item metadata and signal
+payloads arrive". They arrived. The tagged version of v2 would carry an id, an
+Item, a UserSignal, a count and a flag, of which at most two are meaningful per
+message, with nothing in the type saying which. The variant makes that
+unrepresentable, and adding an alternative now fails to compile at every visit
+site until it is handled.
 
 **Sharding needs the hash mixed first.** `std::hash<int>` in libstdc++ *is the
 identity function*, so masking the low bits of an unmixed hash would put every

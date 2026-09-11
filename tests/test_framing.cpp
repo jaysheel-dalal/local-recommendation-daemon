@@ -3,18 +3,22 @@
 #include "lrd/net/unix_socket.hpp"
 #include "lrd/proto/codec.hpp"
 #include "lrd/proto/framing.hpp"
+#include "lrd/rank/item.hpp"
 
 #include "test_harness.hpp"
 
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <variant>
 
 using lrd::net::UnixStream;
 using namespace lrd::proto;
+namespace rank = lrd::rank;
 
 namespace {
 
@@ -50,12 +54,32 @@ ByteBuffer length_prefix(std::uint32_t length) {
     return buffer;
 }
 
-ByteBuffer encode_get(const std::string& key, std::uint64_t id) {
+/// A valid frame body whose length varies with `padding`.
+///
+/// Framing does not care what is inside a frame, but the *codec* does, and these
+/// bodies get decoded to prove the boundaries were right - so they have to be
+/// messages the codec accepts. `padding` therefore grows the number of signal
+/// affinities in a Recommend rather than stretching a single field past its
+/// limit: kMaxCategoryLength caps a category at 64 bytes, which an earlier
+/// version of this helper cheerfully exceeded.
+ByteBuffer encode_get(std::size_t padding, std::uint64_t id) {
     const BinaryCodec codec;
     Request request;
-    request.type = MessageType::GetRequest;
     request.request_id = id;
-    request.key = key;
+
+    if (padding == 0) {
+        request.body = GetItem{id};
+    } else {
+        Recommend recommend;
+        recommend.count = 1;
+        const std::size_t affinities = std::min<std::size_t>(padding, kMaxAffinities);
+        for (std::size_t i = 0; i < affinities; ++i) {
+            recommend.signal.affinities.push_back(
+                rank::CategoryAffinity{"category-" + std::to_string(i), 0.5});
+        }
+        request.body = std::move(recommend);
+    }
+
     ByteBuffer buffer;
     codec.encode(request, buffer);
     return buffer;
@@ -65,7 +89,7 @@ ByteBuffer encode_get(const std::string& key, std::uint64_t id) {
 
 LRD_TEST("a frame round-trips over a socket") {
     StreamPair pair = StreamPair::create();
-    const ByteBuffer body = encode_get("hello", 1);
+    const ByteBuffer body = encode_get(4, 1);
 
     LRD_REQUIRE(write_frame(pair.a, body).ok());
 
@@ -83,9 +107,9 @@ LRD_TEST("back-to-back frames keep their boundaries") {
     // them - a one-byte error in any prefix would corrupt every frame after it.
     StreamPair pair = StreamPair::create();
 
-    const ByteBuffer first = encode_get("a", 1);
-    const ByteBuffer second = encode_get(std::string(500, 'b'), 2);
-    const ByteBuffer third = encode_get("c", 3);
+    const ByteBuffer first = encode_get(0, 1);
+    const ByteBuffer second = encode_get(kMaxAffinities, 2);  // much larger frame
+    const ByteBuffer third = encode_get(0, 3);
 
     LRD_REQUIRE(write_frame(pair.a, first).ok());
     LRD_REQUIRE(write_frame(pair.a, second).ok());
@@ -107,8 +131,7 @@ LRD_TEST("a frame at the maximum size is accepted") {
 
     // Big enough that the kernel must split it across many reads, which is
     // where read_exact earns its keep inside read_frame.
-    const std::string key(kMaxKeyLength, 'k');
-    ByteBuffer body = encode_get(key, 1);
+    ByteBuffer body = encode_get(kMaxAffinities, 1);
     body.resize(kMaxFrameSize);  // pad out to the cap
 
     std::thread writer([&] { (void)write_frame(pair.a, body); });
@@ -203,7 +226,7 @@ LRD_TEST("a peer that dies mid-frame is reported as truncated, not closed") {
     // Truncated means the stream is unusable and the connection must be dropped.
     StreamPair pair = StreamPair::create();
 
-    const ByteBuffer body = encode_get("hello", 1);
+    const ByteBuffer body = encode_get(4, 1);
     write_raw(pair.a, length_prefix(static_cast<std::uint32_t>(body.size())));
     // Send only half the promised body, then hang up.
     ByteBuffer half(body.begin(), body.begin() + static_cast<long>(body.size() / 2));
@@ -232,7 +255,7 @@ LRD_TEST("writing to a closed peer reports PeerClosed") {
     StreamPair pair = StreamPair::create();
     pair.b.close();
 
-    ByteBuffer body = encode_get("hello", 1);
+    ByteBuffer body = encode_get(4, 1);
     body.resize(64 * 1024);  // enough that the send buffer cannot swallow it
 
     const FrameResult result = write_frame(pair.a, body);
@@ -253,11 +276,15 @@ LRD_TEST("write_message encodes and frames in one step") {
     StreamPair pair = StreamPair::create();
     const BinaryCodec codec;
 
+    rank::Item item;
+    item.id = 99;
+    item.category = "tech";
+    item.advertiser = "acme";
+    item.base_score = 0.5;
+
     Response response;
-    response.type = MessageType::GetResponse;
     response.request_id = 99;
-    response.status = StatusCode::Ok;
-    response.value = "value";
+    response.body = GetItemResult{StatusCode::Ok, item};
 
     ByteBuffer scratch;
     LRD_REQUIRE(write_message(pair.a, codec, response, scratch).ok());
@@ -268,5 +295,7 @@ LRD_TEST("write_message encodes and frames in one step") {
     Response decoded;
     LRD_REQUIRE(codec.decode(body, decoded) == DecodeError::None);
     LRD_CHECK_EQ(decoded.request_id, std::uint64_t{99});
-    LRD_CHECK_EQ(decoded.value, std::string("value"));
+    const auto* result = std::get_if<GetItemResult>(&decoded.body);
+    LRD_REQUIRE(result != nullptr);
+    LRD_CHECK_EQ(result->item.category, std::string("tech"));
 }

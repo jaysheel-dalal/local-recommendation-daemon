@@ -36,7 +36,8 @@ add_library(lrd_core STATIC
     proto/message.cpp
     proto/codec.cpp
     proto/framing.cpp
-    concurrency/thread_pool.cpp)
+    concurrency/thread_pool.cpp
+    rank/scorer.cpp)
 
 # PUBLIC on the include dir: anything linking lrd_core also gets include/ on its
 # header search path. That is why tests and bench can #include <lrd/...> without

@@ -20,6 +20,7 @@
 #include "lrd/common/version.hpp"
 #include "lrd/proto/codec.hpp"
 #include "lrd/proto/message.hpp"
+#include "lrd/rank/item.hpp"
 
 #ifdef LRD_WITH_PROTOBUF
 #include "lrd/proto/protobuf_codec.hpp"
@@ -42,8 +43,8 @@ using namespace lrd::proto;
 struct Options {
     std::size_t iterations = 200000;
     std::size_t warmup = 20000;
-    std::size_t key_size = 24;
-    std::size_t value_size = 128;
+    std::size_t category_size = 8;
+    std::size_t recommend_items = 5;
     std::size_t trials = 3;
     bool show_help = false;
 };
@@ -53,8 +54,8 @@ void print_usage(const char* argv0) {
         "usage: %s [options]\n"
         "\n"
         "  --iterations N   encode/decode pairs per message type (default: 200000)\n"
-        "  --key-size N     key bytes (default: 24)\n"
-        "  --value-size N   value bytes (default: 128)\n"
+        "  --category-size N  category bytes (default: 8)\n"
+        "  --items N          items in a recommendation response (default: 5)\n"
         "  --trials N       repeats, median reported (default: 3)\n"
         "  --help\n",
         argv0);
@@ -79,10 +80,10 @@ bool parse_args(int argc, char** argv, Options& out) {
             out.show_help = true;
         } else if (arg == "--iterations" && has_value) {
             if (!parse_size(argv[++i], out.iterations)) return false;
-        } else if (arg == "--key-size" && has_value) {
-            if (!parse_size(argv[++i], out.key_size)) return false;
-        } else if (arg == "--value-size" && has_value) {
-            if (!parse_size(argv[++i], out.value_size)) return false;
+        } else if (arg == "--category-size" && has_value) {
+            if (!parse_size(argv[++i], out.category_size)) return false;
+        } else if (arg == "--items" && has_value) {
+            if (!parse_size(argv[++i], out.recommend_items)) return false;
         } else if (arg == "--trials" && has_value) {
             if (!parse_size(argv[++i], out.trials)) return false;
         } else {
@@ -161,7 +162,7 @@ CaseResult median_of(std::vector<CaseResult> runs) {
 }
 
 void report(const char* label, const CaseResult& result) {
-    std::printf("%-18s %12.1f %12.1f %12zu\n", label, result.encode_ns, result.decode_ns,
+    std::printf("%-20s %12.1f %12.1f %12zu\n", label, result.encode_ns, result.decode_ns,
                 result.wire_bytes);
 }
 
@@ -176,48 +177,71 @@ void measure(const char* label, const Codec& codec, const Message& message,
     report(label, median_of(std::move(runs)));
 }
 
+lrd::rank::Item bench_item(const Options& opts) {
+    lrd::rank::Item item;
+    item.id = 1234567890123456789ULL;
+    item.category = filler(opts.category_size, 'a');
+    item.advertiser = filler(opts.category_size, 'A');
+    item.base_score = 0.8125;
+    item.created_at = lrd::rank::from_epoch_millis(1700000000000LL);
+    item.expires_at = lrd::rank::from_epoch_millis(1800000000000LL);
+    return item;
+}
+
 void run_codec(const Codec& codec, const Options& opts) {
     std::printf("\n=== %s ===\n", codec.name());
-    std::printf("%-18s %12s %12s %12s\n", "message", "encode ns", "decode ns", "wire bytes");
+    std::printf("%-20s %12s %12s %12s\n", "message", "encode ns", "decode ns", "wire bytes");
 
-    const std::string key = filler(opts.key_size, 'a');
-    const std::string value = filler(opts.value_size, 'A');
+    const std::uint64_t request_id = 1234567890123456789ULL;
 
     Request get;
-    get.type = MessageType::GetRequest;
-    get.request_id = 1234567890123456789ULL;
-    get.key = key;
-    measure("GetRequest", codec, get, opts);
+    get.request_id = request_id;
+    get.body = GetItem{42};
+    measure("GetItemRequest", codec, get, opts);
 
     Request put;
-    put.type = MessageType::PutRequest;
-    put.request_id = 1234567890123456789ULL;
-    put.key = key;
-    put.value = value;
-    measure("PutRequest", codec, put, opts);
+    put.request_id = request_id;
+    put.body = PutItem{bench_item(opts)};
+    measure("PutItemRequest", codec, put, opts);
 
     Request stats_request;
-    stats_request.type = MessageType::StatsRequest;
     stats_request.request_id = 42;
+    stats_request.body = GetStats{};
     measure("StatsRequest", codec, stats_request, opts);
 
+    Recommend recommend;
+    recommend.signal.affinities = {{"tech", 0.9}, {"sport", 0.5}, {"travel", 0.2}};
+    recommend.signal.excluded_categories = {"gambling"};
+    recommend.count = static_cast<std::uint32_t>(opts.recommend_items);
+    Request recommend_request;
+    recommend_request.request_id = request_id;
+    recommend_request.body = recommend;
+    measure("RecommendRequest", codec, recommend_request, opts);
+
     Response get_response;
-    get_response.type = MessageType::GetResponse;
-    get_response.request_id = 1234567890123456789ULL;
-    get_response.status = StatusCode::Ok;
-    get_response.value = value;
-    measure("GetResponse", codec, get_response, opts);
+    get_response.request_id = request_id;
+    get_response.body = GetItemResult{StatusCode::Ok, bench_item(opts)};
+    measure("GetItemResponse", codec, get_response, opts);
 
     Response put_response;
-    put_response.type = MessageType::PutResponse;
-    put_response.request_id = 1234567890123456789ULL;
-    put_response.status = StatusCode::Ok;
-    measure("PutResponse", codec, put_response, opts);
+    put_response.request_id = request_id;
+    put_response.body = PutItemResult{StatusCode::Ok};
+    measure("PutItemResponse", codec, put_response, opts);
+
+    RecommendResult recommend_result;
+    recommend_result.status = StatusCode::Ok;
+    for (std::size_t i = 0; i < opts.recommend_items; ++i) {
+        recommend_result.items.push_back(lrd::rank::RankedItem{
+            static_cast<lrd::rank::ItemId>(i + 1), 1.0 / static_cast<double>(i + 1),
+            filler(opts.category_size, 'a'), filler(opts.category_size, 'A')});
+    }
+    Response recommend_response;
+    recommend_response.request_id = request_id;
+    recommend_response.body = recommend_result;
+    measure("RecommendResponse", codec, recommend_response, opts);
 
     Response stats_response;
-    stats_response.type = MessageType::StatsResponse;
-    stats_response.status = StatusCode::Ok;
-    stats_response.stats = Stats{100, 60, 30, 10, 45, 15, 5, 20, 64};
+    stats_response.body = StatsResult{StatusCode::Ok, Stats{100, 60, 30, 10, 5, 45, 15, 4, 20, 64}};
     measure("StatsResponse", codec, stats_response, opts);
 }
 
@@ -236,8 +260,9 @@ int main(int argc, char** argv) {
 
     std::printf("lrd_codec_bench: %s\n", std::string(lrd::build_info()).c_str());
     std::printf("  no sockets: encode/decode CPU cost and wire size only\n");
-    std::printf("  key %zu bytes, value %zu bytes, %zu iterations, median of %zu trials\n",
-                opts.key_size, opts.value_size, opts.iterations, opts.trials);
+    std::printf("  category/advertiser %zu bytes, %zu recommended items, %zu iterations, "
+                "median of %zu trials\n",
+                opts.category_size, opts.recommend_items, opts.iterations, opts.trials);
 
     const BinaryCodec binary;
     run_codec(binary, opts);

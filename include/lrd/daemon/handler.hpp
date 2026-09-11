@@ -2,73 +2,75 @@
 
 #include "lrd/cache/sharded_cache.hpp"
 #include "lrd/proto/message.hpp"
+#include "lrd/rank/item.hpp"
+#include "lrd/rank/scorer.hpp"
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <string>
+#include <utility>
+#include <vector>
 
 namespace lrd::daemon {
 
 /// Turns a decoded request into a response.
 ///
-/// Deliberately knows nothing about sockets, frames or byte order: it takes a
-/// Request and returns a Response. That is what makes it testable without a
-/// socket, and it is the seam step 3 cut along - the std::unordered_map became
-/// an LruCache without changing anything else, and in step 5 that became a
-/// LockedCache the same way.
+/// Knows nothing about sockets, frames or byte order: Request in, Response out.
+/// That is what makes it testable without a socket, and it is the seam every
+/// step so far has cut along - the store went from std::unordered_map to
+/// LruCache to LockedCache to ShardedCache, and in step 9 from strings to item
+/// metadata, without anything above it changing shape.
 ///
 /// ## Thread safety
 ///
 /// `handle()` is safe to call concurrently from any number of threads. One
-/// Handler is shared by every worker, because the whole point is that a PUT on
-/// one connection is visible to a GET on another.
+/// Handler is shared by every worker, because the point is that a PutItem on one
+/// connection is visible to a Recommend on another.
 ///
-/// Two different mechanisms, for two different reasons:
-///
-///   * The cache is guarded by a mutex per shard inside ShardedCache, because
-///     its operations are compound - find, splice, maybe evict - and have to
-///     happen as a unit.
-///   * The counters are individual atomics, because each is a standalone
-///     increment with nothing to keep consistent against anything else. Putting
-///     them under the cache's mutex would lengthen its critical section for no
-///     benefit; giving them their own mutex would add a second point of
-///     contention on the hot path.
-///
-/// The tradeoff of that second choice is stated plainly: a STATS response is
-/// not a consistent snapshot. Counters are read one at a time while other
-/// threads keep working, so `hits + misses` may not exactly equal `gets` for a
-/// reading taken under load. For reporting that is fine, and the alternative -
-/// a lock spanning all six counters plus the cache - would cost real throughput
-/// to make a diagnostic prettier.
+/// Two mechanisms, for two reasons: the cache is guarded by a mutex per shard
+/// because its operations are compound, and the counters are individual atomics
+/// because each is a standalone increment with nothing to stay consistent
+/// against. The cost of the second choice, stated plainly: a STATS response is
+/// not a consistent snapshot.
 class Handler {
 public:
-    /// `capacity` is the total entries held before LRU eviction begins;
-    /// `shard_count` is how many independently locked stripes it is split into
-    /// and must be a power of two. One shard is exactly the step 5 behaviour.
-    Handler(std::size_t capacity, std::size_t shard_count)
-        : cache_(capacity, shard_count) {}
+    /// `capacity` is total entries before LRU eviction; `shard_count` must be a
+    /// power of two. `scoring` is the ranking heuristic's configuration.
+    ///
+    /// `clock` is injected rather than hardcoded so ranking tests can pin "now"
+    /// instead of depending on the wall clock - a recency term evaluated against
+    /// a moving clock makes every score assertion approximate. nullptr means the
+    /// system clock.
+    ///
+    /// Passed at construction rather than through a setter: Handler owns a
+    /// ShardedCache and a set of atomics, so it is neither copyable nor movable,
+    /// and a two-step "construct then configure" forces callers into contortions
+    /// to return one. A function pointer rather than std::function because the
+    /// clock is called once per recommendation and carries no state.
+    Handler(std::size_t capacity, std::size_t shard_count, rank::ScoringConfig scoring = {},
+            rank::Timestamp (*clock)() = nullptr);
 
     [[nodiscard]] proto::Response handle(const proto::Request& request);
 
-    /// A snapshot of the counters. See the note above on consistency.
     [[nodiscard]] proto::Stats stats() const;
 
 private:
-    [[nodiscard]] proto::Response handle_get(const proto::Request& request);
-    [[nodiscard]] proto::Response handle_put(const proto::Request& request);
-    [[nodiscard]] proto::Response handle_delete(const proto::Request& request);
-    [[nodiscard]] proto::Response handle_stats(const proto::Request& request) const;
+    [[nodiscard]] proto::ResponseBody on_get(const proto::GetItem& request);
+    [[nodiscard]] proto::ResponseBody on_put(const proto::PutItem& request);
+    [[nodiscard]] proto::ResponseBody on_delete(const proto::DeleteItem& request);
+    [[nodiscard]] proto::ResponseBody on_stats() const;
+    [[nodiscard]] proto::ResponseBody on_recommend(const proto::Recommend& request);
 
-    cache::ShardedCache<std::string, std::string> cache_;
+    cache::ShardedCache<rank::ItemId, rank::Item> cache_;
+    rank::ScoringConfig scoring_;
+    rank::Timestamp (*clock_)() = nullptr;
 
-    // relaxed ordering throughout: these are pure counters. Nothing else reads
-    // them to decide anything, so there is no happens-before relationship to
-    // establish and no reason to pay for one.
+    // relaxed ordering: pure counters, nothing reads them to decide anything.
     std::atomic<std::uint64_t> requests_{0};
     std::atomic<std::uint64_t> gets_{0};
     std::atomic<std::uint64_t> puts_{0};
     std::atomic<std::uint64_t> deletes_{0};
+    std::atomic<std::uint64_t> recommends_{0};
     std::atomic<std::uint64_t> hits_{0};
     std::atomic<std::uint64_t> misses_{0};
 };

@@ -162,6 +162,20 @@ public:
     [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
     [[nodiscard]] const CacheMetrics& metrics() const noexcept { return metrics_; }
 
+    /// Visits every entry, oldest-to-newest, without disturbing recency.
+    ///
+    /// **const, and that is the point.** Ranking has to scan the whole cache to
+    /// score candidates. Doing that through get() would mark every item
+    /// most-recently-used on every recommendation, which destroys the recency
+    /// signal the eviction policy depends on - the cache would evict essentially
+    /// at random. A scan is not a use.
+    template <typename Fn>
+    void for_each(Fn&& visit) const {
+        for (const Entry& entry : entries_) {
+            visit(entry.key, entry.value);
+        }
+    }
+
     /// Keys in recency order, most-recently-used first.
     ///
     /// Exists for tests: asserting on eviction *order* is the only way to know

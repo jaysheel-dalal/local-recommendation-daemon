@@ -1,6 +1,7 @@
 #include "lrd/client/connection.hpp"
 #include "lrd/common/errors.hpp"
 #include "lrd/daemon/server.hpp"
+#include "lrd/rank/item.hpp"
 
 #include "test_harness.hpp"
 
@@ -18,6 +19,7 @@ using lrd::client::CallStatus;
 using lrd::client::Connection;
 using lrd::daemon::Server;
 using lrd::daemon::ServerConfig;
+namespace rank = lrd::rank;
 using namespace std::chrono_literals;
 
 namespace {
@@ -64,18 +66,34 @@ ServerConfig config_for(const std::string& path, std::size_t threads = 4,
     return config;
 }
 
+/// Builds an item with a fixed creation time, so the recency term does not vary
+/// between runs.
+rank::Item item_of(rank::ItemId id, const std::string& category, double score,
+                   const std::string& advertiser = "acme") {
+    rank::Item item;
+    item.id = id;
+    item.category = category;
+    item.advertiser = advertiser;
+    item.base_score = score;
+    item.created_at = rank::from_epoch_millis(1700000000000LL);
+    item.expires_at = rank::from_epoch_millis(0);
+    return item;
+}
+
 }  // namespace
 
-LRD_TEST("a single client can put and get") {
+LRD_TEST("a single client can put and get an item") {
     const std::string path = temp_socket_path();
     RunningServer server(config_for(path));
 
     Connection client = Connection::connect(path);
-    LRD_REQUIRE(client.put("k", "v") == CallStatus::Ok);
+    LRD_REQUIRE(client.put_item(item_of(1, "tech", 0.5)) == CallStatus::Ok);
 
-    std::string value;
-    LRD_REQUIRE(client.get("k", value) == CallStatus::Ok);
-    LRD_CHECK_EQ(value, std::string("v"));
+    rank::Item fetched;
+    LRD_REQUIRE(client.get_item(1, fetched) == CallStatus::Ok);
+    LRD_CHECK_EQ(fetched.id, rank::ItemId{1});
+    LRD_CHECK_EQ(fetched.category, std::string("tech"));
+    LRD_CHECK_EQ(fetched.base_score, 0.5);
 }
 
 LRD_TEST("state written on one connection is visible on another") {
@@ -86,12 +104,12 @@ LRD_TEST("state written on one connection is visible on another") {
     RunningServer server(config_for(path));
 
     Connection writer = Connection::connect(path);
-    LRD_REQUIRE(writer.put("shared", "written-by-writer") == CallStatus::Ok);
+    LRD_REQUIRE(writer.put_item(item_of(42, "travel", 0.9, "globex")) == CallStatus::Ok);
 
     Connection reader = Connection::connect(path);
-    std::string value;
-    LRD_REQUIRE(reader.get("shared", value) == CallStatus::Ok);
-    LRD_CHECK_EQ(value, std::string("written-by-writer"));
+    rank::Item fetched;
+    LRD_REQUIRE(reader.get_item(42, fetched) == CallStatus::Ok);
+    LRD_CHECK_EQ(fetched.advertiser, std::string("globex"));
 }
 
 LRD_TEST("eight concurrent clients each see their own values intact") {
@@ -120,21 +138,26 @@ LRD_TEST("eight concurrent clients each see their own values intact") {
                 Connection connection = Connection::connect(path);
 
                 for (int i = 0; i < kOpsPerClient; ++i) {
-                    const std::string key = "c" + std::to_string(c) + "-k" + std::to_string(i);
-                    const std::string expected = "c" + std::to_string(c) + "-v" +
-                                                 std::to_string(i) + std::string(200, 'x');
+                    // Disjoint id ranges per client, so each verifies only its
+                    // own writes and eviction cannot be mistaken for corruption.
+                    const auto id = static_cast<rank::ItemId>(c * 100000 + i + 1);
+                    const rank::Item expected =
+                        item_of(id, "cat-" + std::to_string(c),
+                                0.001 * static_cast<double>(i + 1), "adv-" + std::to_string(c));
 
-                    if (connection.put(key, expected) != CallStatus::Ok) {
+                    if (connection.put_item(expected) != CallStatus::Ok) {
                         failures.fetch_add(1);
                         return;
                     }
 
-                    std::string actual;
-                    if (connection.get(key, actual) != CallStatus::Ok) {
+                    rank::Item actual;
+                    if (connection.get_item(id, actual) != CallStatus::Ok) {
                         failures.fetch_add(1);
                         return;
                     }
-                    if (actual != expected) {
+                    if (actual.id != expected.id || actual.category != expected.category ||
+                        actual.base_score != expected.base_score ||
+                        actual.advertiser != expected.advertiser) {
                         mismatches.fetch_add(1);
                     }
                 }
@@ -164,19 +187,24 @@ LRD_TEST("concurrent clients contending on the same keys stay consistent") {
             clients.emplace_back([&] {
                 Connection connection = Connection::connect(path);
                 for (int i = 0; i < 400; ++i) {
-                    const std::string key = "hot-" + std::to_string(i % 50);
-                    const std::string expected = "value-of-" + key;
+                    // Every client writes the same 50 ids, so they contend. The
+                    // item's content is derived from its id, so whichever client
+                    // wrote last, the value read back must still match its id.
+                    const auto id = static_cast<rank::ItemId>((i % 50) + 1);
+                    const rank::Item expected =
+                        item_of(id, "cat-" + std::to_string(id), 0.01 * static_cast<double>(id));
 
-                    if (connection.put(key, expected) != CallStatus::Ok) {
+                    if (connection.put_item(expected) != CallStatus::Ok) {
                         return;
                     }
 
-                    std::string actual;
-                    const CallStatus status = connection.get(key, actual);
-                    // NotFound is legitimate: the cache holds 32 entries and 50
-                    // keys are in play, so another client's writes can evict
-                    // ours between the put and the get. A *wrong* value is not.
-                    if (status == CallStatus::Ok && actual != expected) {
+                    rank::Item actual;
+                    const CallStatus status = connection.get_item(id, actual);
+                    // NotFound is legitimate: 32 entries of capacity and 50 ids
+                    // in play, so another client can evict ours between the put
+                    // and the get. A *wrong* item is not.
+                    if (status == CallStatus::Ok &&
+                        (actual.id != expected.id || actual.category != expected.category)) {
                         mismatches.fetch_add(1);
                     }
                 }
@@ -199,7 +227,8 @@ LRD_TEST("stats aggregate work from every connection") {
             clients.emplace_back([&, c] {
                 Connection connection = Connection::connect(path);
                 for (int i = 0; i < kPuts; ++i) {
-                    (void)connection.put("c" + std::to_string(c) + "-" + std::to_string(i), "v");
+                    (void)connection.put_item(
+                        item_of(static_cast<rank::ItemId>(c * 1000 + i + 1), "tech", 0.5));
                 }
             });
         }
@@ -209,6 +238,57 @@ LRD_TEST("stats aggregate work from every connection") {
     lrd::proto::Stats stats;
     LRD_REQUIRE(observer.fetch_stats(stats) == CallStatus::Ok);
     LRD_CHECK_EQ(stats.puts, static_cast<std::uint64_t>(kClients * kPuts));
+}
+
+LRD_TEST("recommend works over the socket and respects exclusions") {
+    // The step 9 milestone end to end: items stored by one connection, a signal
+    // sent by another, a ranked slate back.
+    const std::string path = temp_socket_path();
+    RunningServer server(config_for(path, 4, /*capacity=*/512));
+
+    Connection publisher = Connection::connect(path);
+    const char* categories[] = {"tech", "sport", "food", "gambling"};
+    for (rank::ItemId id = 1; id <= 40; ++id) {
+        const std::string category = categories[(id - 1) % 4];
+        LRD_REQUIRE(publisher.put_item(item_of(id, category,
+                                               0.02 * static_cast<double>(id),
+                                               "adv-" + std::to_string(id % 5))) ==
+                    CallStatus::Ok);
+    }
+
+    Connection reader = Connection::connect(path);
+
+    rank::UserSignal signal;
+    signal.affinities = {{"tech", 1.0}, {"sport", 0.4}};
+    signal.excluded_categories = {"gambling"};
+
+    std::vector<rank::RankedItem> ranked;
+    LRD_REQUIRE(reader.recommend(signal, 5, ranked) == CallStatus::Ok);
+
+    LRD_REQUIRE(!ranked.empty());
+    LRD_CHECK(ranked.size() <= 5);
+    for (const rank::RankedItem& item : ranked) {
+        LRD_CHECK(item.category != "gambling");
+        LRD_CHECK(item.score > 0.0);
+    }
+    // Scores must come back in non-increasing order.
+    for (std::size_t i = 1; i < ranked.size(); ++i) {
+        LRD_CHECK(ranked[i - 1].score >= ranked[i].score);
+    }
+    // The top slot should be tech - the strongest affinity.
+    LRD_CHECK_EQ(ranked[0].category, std::string("tech"));
+}
+
+LRD_TEST("a recommendation asking for zero items is rejected, not fatal") {
+    const std::string path = temp_socket_path();
+    RunningServer server(config_for(path));
+
+    Connection client = Connection::connect(path);
+    std::vector<rank::RankedItem> ranked;
+    LRD_CHECK(client.recommend(rank::UserSignal{}, 0, ranked) == CallStatus::InvalidRequest);
+    // And the connection survives a rejected request.
+    LRD_CHECK(client.connected());
+    LRD_CHECK(client.put_item(item_of(1, "tech", 0.5)) == CallStatus::Ok);
 }
 
 // --------------------------------------------------------------------------
@@ -251,7 +331,7 @@ LRD_TEST("shutdown interrupts a connection blocked waiting for a request") {
     std::this_thread::sleep_for(50ms);
 
     Connection idle = Connection::connect(path);
-    LRD_REQUIRE(idle.put("k", "v") == CallStatus::Ok);
+    LRD_REQUIRE(idle.put_item(item_of(1, "tech", 0.5)) == CallStatus::Ok);
     // Now the worker is blocked reading the next request that never comes.
     std::this_thread::sleep_for(50ms);
 
@@ -274,15 +354,15 @@ LRD_TEST("a client sees a clean disconnect when the daemon stops") {
     std::this_thread::sleep_for(50ms);
 
     Connection client = Connection::connect(path);
-    LRD_REQUIRE(client.put("k", "v") == CallStatus::Ok);
+    LRD_REQUIRE(client.put_item(item_of(1, "tech", 0.5)) == CallStatus::Ok);
 
     server.request_stop();
     runner.join();
 
     // The next call fails as a lost connection rather than hanging or
     // returning nonsense.
-    std::string value;
-    const CallStatus status = client.get("k", value);
+    rank::Item fetched;
+    const CallStatus status = client.get_item(1, fetched);
     LRD_CHECK(status == CallStatus::ConnectionLost);
     LRD_CHECK(!client.connected());
 }

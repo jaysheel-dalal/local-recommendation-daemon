@@ -12,6 +12,8 @@
 #include "workload.hpp"
 
 #include "lrd/client/connection.hpp"
+#include "lrd/rank/item.hpp"
+#include "lrd/rank/signal.hpp"
 #include "lrd/common/errors.hpp"
 #include "lrd/common/log.hpp"
 #include "lrd/common/version.hpp"
@@ -47,8 +49,13 @@ struct Options {
     std::size_t requests_per_thread = 20000;
     std::size_t warmup_per_thread = 2000;
     std::size_t key_count = 10000;
-    std::size_t value_size = 128;
     double read_ratio = 0.9;
+
+    /// Fraction of the non-read operations that are recommendations rather than
+    /// writes. Recommendations scan the whole store, so they are far more
+    /// expensive than a point lookup and a realistic mix has to include some.
+    double recommend_ratio = 0.05;
+    std::uint32_t recommend_count = 5;
     double zipf_theta = 0.99;
     double target_rate = 0.0;  ///< requests/sec/thread; 0 = closed loop
     std::size_t trials = 3;    ///< repeats per point; the median is reported
@@ -66,7 +73,8 @@ void print_usage(const char* argv0) {
         "  --requests N       measured requests per thread (default: 20000)\n"
         "  --warmup N         unmeasured requests per thread first (default: 2000)\n"
         "  --keys N           key space size (default: 10000)\n"
-        "  --value-size N     value bytes (default: 128)\n"
+        "  --recommend-ratio F fraction of requests that are recommendations (default: 0.05)\n"
+        "  --recommend-count N items per recommendation (default: 5)\n"
         "  --read-ratio F     fraction of GETs, 0..1 (default: 0.9)\n"
         "  --zipf F           skew; 0 = uniform (default: 0.99)\n"
         "  --rate F           open-loop target requests/sec/thread (default: 0 = closed loop)\n"
@@ -117,8 +125,12 @@ bool parse_args(int argc, char** argv, Options& out) {
             out.warmup_per_thread = static_cast<std::size_t>(std::strtoull(argv[++i], nullptr, 10));
         } else if (arg == "--keys" && has_value) {
             if (!parse_size(argv[++i], out.key_count)) return false;
-        } else if (arg == "--value-size" && has_value) {
-            if (!parse_size(argv[++i], out.value_size)) return false;
+        } else if (arg == "--recommend-ratio" && has_value) {
+            if (!parse_double(argv[++i], out.recommend_ratio)) return false;
+        } else if (arg == "--recommend-count" && has_value) {
+            std::size_t count = 0;
+            if (!parse_size(argv[++i], count)) return false;
+            out.recommend_count = static_cast<std::uint32_t>(count);
         } else if (arg == "--read-ratio" && has_value) {
             if (!parse_double(argv[++i], out.read_ratio)) return false;
         } else if (arg == "--zipf" && has_value) {
@@ -145,8 +157,9 @@ struct RunResult {
 };
 
 /// One client thread's workload.
-void run_thread(const Options& opts, std::size_t thread_index, const std::vector<std::string>& keys,
-                const std::string& value, LatencySamples& samples, std::atomic<std::uint64_t>& errors,
+void run_thread(const Options& opts, std::size_t thread_index,
+                const std::vector<lrd::rank::Item>& items, const lrd::rank::UserSignal& signal,
+                LatencySamples& samples, std::atomic<std::uint64_t>& errors,
                 std::atomic<std::uint64_t>& mismatches, std::atomic<std::uint64_t>& misses,
                 std::atomic<bool>& start_flag) {
     // One Connection per thread. Connection is deliberately not thread-safe -
@@ -160,19 +173,29 @@ void run_thread(const Options& opts, std::size_t thread_index, const std::vector
     KeyDistribution distribution(opts.key_count, opts.zipf_theta);
     std::uniform_real_distribution<double> coin(0.0, 1.0);
 
-    std::string scratch;
-    scratch.reserve(opts.value_size + 64);
+    lrd::rank::Item scratch_item;
+    std::vector<lrd::rank::RankedItem> scratch_ranked;
+    scratch_ranked.reserve(opts.recommend_count);
+
+    /// Picks the operation for this iteration. Reads dominate, writes refresh the
+    /// store, and a small slice are recommendations - which cost far more than
+    /// either because they scan every shard.
+    const auto choose_and_run = [&](const lrd::rank::Item& item) {
+        const double roll = coin(rng);
+        if (roll < opts.read_ratio) {
+            return connection.get_item(item.id, scratch_item);
+        }
+        if (roll < opts.read_ratio + opts.recommend_ratio) {
+            return connection.recommend(signal, opts.recommend_count, scratch_ranked);
+        }
+        return connection.put_item(item);
+    };
 
     // Warmup. Excluded from the numbers because the first requests on a fresh
-    // connection pay for buffer growth, page faults and an empty cache - real
+    // connection pay for buffer growth, page faults and an empty store - real
     // costs, but one-off ones that would otherwise land entirely in the tail.
     for (std::size_t i = 0; i < opts.warmup_per_thread; ++i) {
-        const std::string& key = keys[distribution.next(rng)];
-        if (coin(rng) < opts.read_ratio) {
-            (void)connection.get(key, scratch);
-        } else {
-            (void)connection.put(key, value);
-        }
+        (void)choose_and_run(items[distribution.next(rng)]);
     }
 
     // All threads start measuring together, so the wall-clock window matches
@@ -188,8 +211,7 @@ void run_thread(const Options& opts, std::size_t thread_index, const std::vector
                               : std::chrono::nanoseconds(0);
 
     for (std::size_t i = 0; i < opts.requests_per_thread; ++i) {
-        const std::string& key = keys[distribution.next(rng)];
-        const bool is_read = coin(rng) < opts.read_ratio;
+        const lrd::rank::Item& item = items[distribution.next(rng)];
 
         // Open-loop mode, and why it exists.
         //
@@ -213,16 +235,15 @@ void run_thread(const Options& opts, std::size_t thread_index, const std::vector
         const auto issued = std::chrono::steady_clock::now();
         const auto measure_from = (interval.count() > 0) ? due : issued;
 
-        CallStatus status = CallStatus::Ok;
-        if (is_read) {
-            status = connection.get(key, scratch);
-            if (status == CallStatus::NotFound) {
-                misses.fetch_add(1, std::memory_order_relaxed);
-            } else if (status == CallStatus::Ok && scratch != value) {
-                mismatches.fetch_add(1, std::memory_order_relaxed);
-            }
-        } else {
-            status = connection.put(key, value);
+        const CallStatus status = choose_and_run(item);
+        if (status == CallStatus::NotFound) {
+            misses.fetch_add(1, std::memory_order_relaxed);
+        } else if (status == CallStatus::Ok && scratch_item.id != 0 &&
+                   scratch_item.id != item.id) {
+            // A fetched item whose id does not match what was asked for would
+            // mean the protocol had desynchronised - the numbers would be
+            // meaningless, so it is counted and reported rather than ignored.
+            mismatches.fetch_add(1, std::memory_order_relaxed);
         }
 
         samples.add(std::chrono::steady_clock::now() - measure_from);
@@ -237,8 +258,8 @@ void run_thread(const Options& opts, std::size_t thread_index, const std::vector
 }
 
 RunResult run_once(const Options& opts, std::size_t threads) {
-    const std::vector<std::string> keys = make_keys(opts.key_count);
-    const std::string value = make_value(opts.value_size);
+    const std::vector<lrd::rank::Item> items = make_items(opts.key_count, bench_now());
+    const lrd::rank::UserSignal signal = make_signal();
 
     std::vector<LatencySamples> samples;
     samples.reserve(threads);
@@ -265,7 +286,7 @@ RunResult run_once(const Options& opts, std::size_t threads) {
                 // "terminate called recursively" and no usable diagnostic. The
                 // same rule the thread pool's workers follow applies here.
                 try {
-                    run_thread(opts, t, keys, value, samples[t], errors, mismatches, misses,
+                    run_thread(opts, t, items, signal, samples[t], errors, mismatches, misses,
                                start_flag);
                 } catch (const std::exception& e) {
                     errors.fetch_add(1, std::memory_order_relaxed);
@@ -304,7 +325,8 @@ void describe(const Options& opts) {
     std::printf("  socket      %s\n", opts.socket_path.c_str());
     std::printf("  codec       %s\n", opts.codec_name.c_str());
     std::printf("  keys        %zu (zipf theta %.2f)\n", opts.key_count, opts.zipf_theta);
-    std::printf("  value       %zu bytes\n", opts.value_size);
+    std::printf("  recommend   %.2f of requests, %u items each\n", opts.recommend_ratio,
+                opts.recommend_count);
     std::printf("  read ratio  %.2f\n", opts.read_ratio);
     std::printf("  requests    %zu per thread (after %zu warmup)\n", opts.requests_per_thread,
                 opts.warmup_per_thread);

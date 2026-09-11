@@ -22,6 +22,7 @@
 #include "workload.hpp"
 
 #include "lrd/cache/sharded_cache.hpp"
+#include "lrd/rank/item.hpp"
 #include "lrd/common/version.hpp"
 
 #include <algorithm>
@@ -44,7 +45,7 @@ namespace {
 constexpr std::array<std::size_t, 5> kSweepThreads{1, 2, 4, 8, 16};
 
 using namespace lrd::bench;
-using Cache = lrd::cache::ShardedCache<std::string, std::string>;
+using Cache = lrd::cache::ShardedCache<lrd::rank::ItemId, lrd::rank::Item>;
 
 /// Shard counts for --shard-sweep. Powers of two, because that is what the
 /// cache accepts - see the mask-versus-modulo note in sharded_cache.hpp.
@@ -56,7 +57,6 @@ struct Options {
     std::size_t warmup_per_thread = 20000;
     std::size_t key_count = 10000;
     std::size_t capacity = 5000;
-    std::size_t value_size = 128;
     double read_ratio = 0.9;
     double zipf_theta = 0.99;
     std::size_t shards = 1;
@@ -122,8 +122,6 @@ bool parse_args(int argc, char** argv, Options& out) {
             if (!parse_size(argv[++i], out.key_count)) return false;
         } else if (arg == "--capacity" && has_value) {
             if (!parse_size(argv[++i], out.capacity)) return false;
-        } else if (arg == "--value-size" && has_value) {
-            if (!parse_size(argv[++i], out.value_size)) return false;
         } else if (arg == "--read-ratio" && has_value) {
             if (!parse_double(argv[++i], out.read_ratio)) return false;
         } else if (arg == "--zipf" && has_value) {
@@ -155,8 +153,10 @@ struct RunResult {
 };
 
 RunResult run_once(const Options& opts, std::size_t threads, std::size_t shards) {
-    const std::vector<std::string> keys = make_keys(opts.key_count);
-    const std::string value = make_value(opts.value_size);
+    // Items rather than strings: the cache now holds ranking candidates, and an
+    // Item is a heavier value than a string - several small allocations - which
+    // is exactly what the contention measurement should be carrying.
+    const std::vector<lrd::rank::Item> items = make_items(opts.key_count, bench_now());
 
     Cache cache(opts.capacity, shards);
 
@@ -186,11 +186,11 @@ RunResult run_once(const Options& opts, std::size_t threads, std::size_t shards)
                 // Warm the cache so the measured window is steady-state rather
                 // than dominated by cold-start insertions.
                 for (std::size_t i = 0; i < opts.warmup_per_thread; ++i) {
-                    const std::string& key = keys[distribution.next(rng)];
+                    const lrd::rank::Item& item = items[distribution.next(rng)];
                     if (coin(rng) < opts.read_ratio) {
-                        (void)cache.get(key);
+                        (void)cache.get(item.id);
                     } else {
-                        cache.put(key, value);
+                        cache.put(item.id, item);
                     }
                 }
 
@@ -202,17 +202,17 @@ RunResult run_once(const Options& opts, std::size_t threads, std::size_t shards)
                 std::uint64_t local_reads = 0;
 
                 for (std::size_t i = 0; i < opts.ops_per_thread; ++i) {
-                    const std::string& key = keys[distribution.next(rng)];
+                    const lrd::rank::Item& item = items[distribution.next(rng)];
                     const bool is_read = coin(rng) < opts.read_ratio;
 
                     const auto issued = std::chrono::steady_clock::now();
                     if (is_read) {
                         ++local_reads;
-                        if (cache.get(key) != nullptr) {
+                        if (cache.get(item.id) != nullptr) {
                             ++local_hits;
                         }
                     } else {
-                        cache.put(key, value);
+                        cache.put(item.id, item);
                     }
                     samples[t].add(std::chrono::steady_clock::now() - issued);
                 }
@@ -269,8 +269,8 @@ int main(int argc, char** argv) {
 
     std::printf("lrd_cache_bench: %s\n", std::string(lrd::build_info()).c_str());
     std::printf("  in-process, no sockets: isolates the cache mutex\n");
-    std::printf("  keys %zu (zipf %.2f), capacity %zu, value %zu bytes, read ratio %.2f\n",
-                opts.key_count, opts.zipf_theta, opts.capacity, opts.value_size, opts.read_ratio);
+    std::printf("  items %zu (zipf %.2f), capacity %zu, read ratio %.2f\n",
+                opts.key_count, opts.zipf_theta, opts.capacity, opts.read_ratio);
 
     // Latencies here are sub-microsecond, so the shared header's microsecond
     // columns would round most of them to 0.0. Nanoseconds instead.

@@ -6,14 +6,16 @@ namespace lrd::proto {
 
 bool is_known_type(std::uint8_t raw) noexcept {
     switch (static_cast<MessageType>(raw)) {
-        case MessageType::GetRequest:
-        case MessageType::PutRequest:
-        case MessageType::DeleteRequest:
+        case MessageType::GetItemRequest:
+        case MessageType::PutItemRequest:
+        case MessageType::DeleteItemRequest:
         case MessageType::StatsRequest:
-        case MessageType::GetResponse:
-        case MessageType::PutResponse:
-        case MessageType::DeleteResponse:
+        case MessageType::RecommendRequest:
+        case MessageType::GetItemResponse:
+        case MessageType::PutItemResponse:
+        case MessageType::DeleteItemResponse:
         case MessageType::StatsResponse:
+        case MessageType::RecommendResponse:
         case MessageType::ErrorResponse:
             return true;
     }
@@ -25,14 +27,16 @@ bool is_known_type(std::uint8_t raw) noexcept {
 
 const char* to_string(MessageType type) noexcept {
     switch (type) {
-        case MessageType::GetRequest: return "GetRequest";
-        case MessageType::PutRequest: return "PutRequest";
-        case MessageType::DeleteRequest: return "DeleteRequest";
+        case MessageType::GetItemRequest: return "GetItemRequest";
+        case MessageType::PutItemRequest: return "PutItemRequest";
+        case MessageType::DeleteItemRequest: return "DeleteItemRequest";
         case MessageType::StatsRequest: return "StatsRequest";
-        case MessageType::GetResponse: return "GetResponse";
-        case MessageType::PutResponse: return "PutResponse";
-        case MessageType::DeleteResponse: return "DeleteResponse";
+        case MessageType::RecommendRequest: return "RecommendRequest";
+        case MessageType::GetItemResponse: return "GetItemResponse";
+        case MessageType::PutItemResponse: return "PutItemResponse";
+        case MessageType::DeleteItemResponse: return "DeleteItemResponse";
         case MessageType::StatsResponse: return "StatsResponse";
+        case MessageType::RecommendResponse: return "RecommendResponse";
         case MessageType::ErrorResponse: return "ErrorResponse";
     }
     return "Unknown";
@@ -63,12 +67,45 @@ const char* to_string(DecodeError error) noexcept {
     return "Unknown";
 }
 
+// std::visit with an Overloaded set rather than a chain of
+// std::holds_alternative checks: adding an alternative to RequestBody makes this
+// fail to compile until a handler for it is added, which is the safety the
+// variant was chosen for.
+MessageType type_of(const RequestBody& body) noexcept {
+    return std::visit(Overloaded{
+                          [](const GetItem&) { return MessageType::GetItemRequest; },
+                          [](const PutItem&) { return MessageType::PutItemRequest; },
+                          [](const DeleteItem&) { return MessageType::DeleteItemRequest; },
+                          [](const GetStats&) { return MessageType::StatsRequest; },
+                          [](const Recommend&) { return MessageType::RecommendRequest; },
+                      },
+                      body);
+}
+
+MessageType type_of(const ResponseBody& body) noexcept {
+    return std::visit(Overloaded{
+                          [](const GetItemResult&) { return MessageType::GetItemResponse; },
+                          [](const PutItemResult&) { return MessageType::PutItemResponse; },
+                          [](const DeleteItemResult&) { return MessageType::DeleteItemResponse; },
+                          [](const StatsResult&) { return MessageType::StatsResponse; },
+                          [](const RecommendResult&) { return MessageType::RecommendResponse; },
+                          [](const Failure&) { return MessageType::ErrorResponse; },
+                      },
+                      body);
+}
+
+StatusCode status_of(const ResponseBody& body) noexcept {
+    // Every alternative happens to expose `status`, so one generic lambda covers
+    // them all. Kept as a single auto lambda rather than six explicit ones: if a
+    // future alternative lacks a status field this stops compiling, which is the
+    // right moment to decide what its status should be.
+    return std::visit([](const auto& result) { return result.status; }, body);
+}
+
 Response make_error(std::uint64_t request_id, StatusCode status, std::string message) {
     Response response;
-    response.type = MessageType::ErrorResponse;
     response.request_id = request_id;
-    response.status = status;
-    response.value = std::move(message);
+    response.body = Failure{status, std::move(message)};
     return response;
 }
 

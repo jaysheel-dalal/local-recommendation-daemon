@@ -297,8 +297,8 @@ void Server::serve_connection(net::UnixStream stream) {
         }
 
         if (config_.verbose) {
-            log_debug("#{} {} key='{}' ({} value bytes)", request.request_id,
-                      proto::to_string(request.type), request.key, request.value.size());
+            log_debug("#{} {}", request.request_id,
+                      proto::to_string(proto::type_of(request.body)));
         }
 
         // handle() is thread-safe; every worker shares this one Handler, which

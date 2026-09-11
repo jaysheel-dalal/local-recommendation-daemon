@@ -1,35 +1,22 @@
-// lrd wire protocol, protobuf encoding.
+// lrd wire protocol v2, protobuf encoding.
 //
 // This describes the *body* of a frame - everything after the 4-byte length
-// prefix. The framing layer is unchanged and shared with binary/v1, because
+// prefix. The framing layer is unchanged and shared with binary/v2, because
 // protobuf deliberately does not do framing: it will happily parse a prefix of
 // a message as a valid shorter message, so something outside it has to say
-// where a message ends. That is what the length prefix is for, and it is why
-// adding protobuf did not make it redundant.
+// where a message ends.
 //
-// See docs/protocol.md for the binary/v1 layout and the comparison.
+// `bytes` rather than `string` for every text field. A protobuf `string` must be
+// valid UTF-8 and implementations may reject anything else; these fields carry
+// arbitrary byte strings. The wire encoding is identical, without the validation.
+//
+// See docs/protocol.md for the binary/v2 layout and the comparison.
 
 syntax = "proto3";
 
 package lrd.wire;
 
-// ---------------------------------------------------------------------------
-// Field types
-// ---------------------------------------------------------------------------
-
-// `bytes`, not `string`, for keys and values.
-//
-// A protobuf `string` is required to be valid UTF-8, and implementations are
-// permitted to reject anything else. Our keys and values are arbitrary byte
-// strings - the test suite deliberately round-trips embedded NULs and
-// non-textual data. Declaring them `string` would compile, pass casual testing,
-// and corrupt or reject real payloads. `bytes` has identical wire encoding with
-// no validation attached.
-
 enum Status {
-  // proto3 requires the first enumerator to be zero, which lines up with
-  // StatusCode::Ok. That is convenient rather than accidental: zero is the
-  // implicit default, so a message that omits the field means "Ok".
   STATUS_OK = 0;
   STATUS_NOT_FOUND = 1;
   STATUS_INVALID_REQUEST = 2;
@@ -37,60 +24,116 @@ enum Status {
 }
 
 // ---------------------------------------------------------------------------
-// Requests
+// Domain types
 // ---------------------------------------------------------------------------
 
-message GetRequest {
-  bytes key = 1;
+message Item {
+  uint64 id = 1;
+  bytes category = 2;
+  bytes advertiser = 3;
+
+  // protobuf's `double` is a fixed 8-byte IEEE-754 field, so this round-trips
+  // exactly - the same guarantee binary/v2 gets by writing the bit pattern.
+  // Scores are compared for ordering, so an approximate encoding would silently
+  // reorder near-ties.
+  double base_score = 4;
+
+  // Milliseconds since the Unix epoch. int64, not uint64: the type should not
+  // make pre-1970 unrepresentable just because this daemon will not see it, and
+  // a negative value here is an obvious bug rather than a value near 2^64.
+  int64 created_at_ms = 5;
+
+  // 0 means "never expires" - the common case, and a zero-valued proto3 scalar
+  // is not serialised at all, so it costs nothing on the wire.
+  int64 expires_at_ms = 6;
 }
 
-message PutRequest {
-  bytes key = 1;
-  bytes value = 2;
+message CategoryAffinity {
+  bytes category = 1;
+  double weight = 2;
 }
 
-message DeleteRequest {
-  bytes key = 1;
+message UserSignal {
+  repeated CategoryAffinity affinities = 1;
+  repeated bytes excluded_categories = 2;
 }
 
-message StatsRequest {}
-
-// ---------------------------------------------------------------------------
-// Responses
-// ---------------------------------------------------------------------------
+message RankedItem {
+  uint64 id = 1;
+  double score = 2;
+  bytes category = 3;
+  bytes advertiser = 4;
+}
 
 message Stats {
   uint64 requests = 1;
   uint64 gets = 2;
   uint64 puts = 3;
   uint64 deletes = 4;
-  uint64 hits = 5;
-  uint64 misses = 6;
-  // Appended in step 3. Under binary/v1 this was a breaking change, because
-  // that decoder rejects trailing bytes; here it is additive and an older peer
-  // simply ignores the new fields. That difference is the whole argument for
-  // protobuf, and docs/benchmarks.md demonstrates it running.
-  uint64 evictions = 7;
-  uint64 entries = 8;
-  uint64 capacity = 9;
+  uint64 recommends = 5;
+  uint64 hits = 6;
+  uint64 misses = 7;
+  uint64 evictions = 8;
+  uint64 entries = 9;
+  uint64 capacity = 10;
 }
 
-message GetResponse {
+// ---------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------
+
+message GetItemRequest {
+  uint64 item_id = 1;
+}
+
+message PutItemRequest {
+  Item item = 1;
+}
+
+message DeleteItemRequest {
+  uint64 item_id = 1;
+}
+
+message StatsRequest {}
+
+message RecommendRequest {
+  UserSignal signal = 1;
+  uint32 count = 2;
+
+  // Rank without recording. Inert in step 9; step 10 makes a non-dry-run
+  // recommendation reserve exposure against each item's cap. Present in the
+  // schema now so that adding the behaviour is not a wire change.
+  bool dry_run = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Responses
+// ---------------------------------------------------------------------------
+
+message GetItemResponse {
   Status status = 1;
-  bytes value = 2;
+  // Absent when status != OK. A message field has explicit presence in proto3,
+  // so "no item" and "an item with every field zeroed" are distinguishable -
+  // which a bare set of scalars would not be.
+  Item item = 2;
 }
 
-message PutResponse {
+message PutItemResponse {
   Status status = 1;
 }
 
-message DeleteResponse {
+message DeleteItemResponse {
   Status status = 1;
 }
 
 message StatsResponse {
   Status status = 1;
   Stats stats = 2;
+}
+
+message RecommendResponse {
+  Status status = 1;
+  repeated RankedItem items = 2;
 }
 
 message ErrorResponse {
@@ -104,27 +147,27 @@ message ErrorResponse {
 
 // One message type on the wire, carrying whichever body applies.
 //
-// The `oneof` replaces binary/v1's explicit type byte *and* its response bit:
-// `body_case()` says which message this is, and whether it is a request or a
-// response falls out of that. A receiver expecting a request and handed a
-// response rejects it on the case alone, before touching any payload.
+// The `oneof` replaces binary/v2's explicit type byte *and* its response bit:
+// body_case() says which message this is, and request-versus-response falls out
+// of that. It mirrors the std::variant the C++ side uses, which is why the
+// mapping between them is mechanical.
 //
-// Field numbers 1-15 encode their tag in a single byte, so the fields on every
-// message stay in that range. `request_id` takes 1 because it is present on
-// every message; the oneof arms take 2-10.
+// Field numbers 1-15 encode their tag in one byte, so everything stays in range.
 message Envelope {
   uint64 request_id = 1;
 
   oneof body {
-    GetRequest get_request = 2;
-    PutRequest put_request = 3;
-    DeleteRequest delete_request = 4;
+    GetItemRequest get_item_request = 2;
+    PutItemRequest put_item_request = 3;
+    DeleteItemRequest delete_item_request = 4;
     StatsRequest stats_request = 5;
+    RecommendRequest recommend_request = 6;
 
-    GetResponse get_response = 6;
-    PutResponse put_response = 7;
-    DeleteResponse delete_response = 8;
-    StatsResponse stats_response = 9;
-    ErrorResponse error_response = 10;
+    GetItemResponse get_item_response = 7;
+    PutItemResponse put_item_response = 8;
+    DeleteItemResponse delete_item_response = 9;
+    StatsResponse stats_response = 10;
+    RecommendResponse recommend_response = 11;
+    ErrorResponse error_response = 12;
   }
 }

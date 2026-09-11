@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 namespace lrd::cache {
 
@@ -86,6 +87,26 @@ public:
     void clear() {
         const std::lock_guard<std::mutex> lock(mutex_);
         cache_.clear();
+    }
+
+    /// Copies every entry into `out` (cleared first) under one lock acquisition.
+    ///
+    /// Copies rather than visiting in place: the alternative is running the
+    /// caller's callback while holding the mutex, which for a scoring pass over
+    /// thousands of items would serialise every other thread behind it. What is
+    /// copied is a key and a refcounted pointer - cheap, and the shared_ptr keeps
+    /// each value alive after the lock is gone even if it is evicted moments
+    /// later. That is the property the return type was chosen for in step 3.
+    ///
+    /// `out`'s capacity is reused across calls, so a repeated scan settles into
+    /// no allocation.
+    void snapshot(std::vector<std::pair<Key, ValuePtr>>& out) const {
+        out.clear();
+        const std::lock_guard<std::mutex> lock(mutex_);
+        out.reserve(cache_.size());
+        cache_.for_each([&out](const Key& key, const ValuePtr& value) {
+            out.emplace_back(key, value);
+        });
     }
 
     [[nodiscard]] std::size_t size() const {

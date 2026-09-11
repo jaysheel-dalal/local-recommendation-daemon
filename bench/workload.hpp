@@ -1,6 +1,10 @@
 #pragma once
 
+#include "lrd/rank/item.hpp"
+#include "lrd/rank/signal.hpp"
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -68,25 +72,54 @@ private:
     std::vector<double> cdf_;
 };
 
-/// Keys are precomputed rather than formatted per request. std::to_string plus
-/// a concatenation on the hot path would put an allocation and an integer
-/// format inside the timed region, which for a request costing a few
-/// microseconds is not negligible.
-[[nodiscard]] inline std::vector<std::string> make_keys(std::size_t count) {
-    std::vector<std::string> keys;
-    keys.reserve(count);
-    for (std::size_t i = 0; i < count; ++i) {
-        keys.push_back("bench-key-" + std::to_string(i));
-    }
-    return keys;
+/// Item ids are 1-based: zero is reserved as "unset" and the daemon rejects it.
+[[nodiscard]] inline lrd::rank::ItemId key_at(std::size_t index) noexcept {
+    return static_cast<lrd::rank::ItemId>(index + 1);
 }
 
-[[nodiscard]] inline std::string make_value(std::size_t size) {
-    std::string value(size, '\0');
-    for (std::size_t i = 0; i < size; ++i) {
-        value[i] = static_cast<char>('a' + (i % 26));
+/// Builds the item set the benchmark stores and ranks.
+///
+/// Precomputed rather than generated per request: building a category and an
+/// advertiser string on the hot path would put two allocations inside the timed
+/// region, which for a request costing a few microseconds is not negligible.
+///
+/// Ages are spread deterministically over ten days so the recency term has
+/// something to do, and base scores over (0, 1] so ranking has something to
+/// order by. Fixed rather than random, so a run is reproducible.
+[[nodiscard]] inline std::vector<lrd::rank::Item> make_items(std::size_t count,
+                                                             lrd::rank::Timestamp now) {
+    static constexpr const char* kCategories[] = {"tech", "sport", "travel",
+                                                  "food", "music", "gaming"};
+    static constexpr const char* kAdvertisers[] = {"acme", "globex", "initech", "umbrella"};
+    constexpr std::size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]);
+    constexpr std::size_t kAdvertiserCount = sizeof(kAdvertisers) / sizeof(kAdvertisers[0]);
+
+    std::vector<lrd::rank::Item> items;
+    items.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        lrd::rank::Item item;
+        item.id = key_at(i);
+        item.category = kCategories[i % kCategoryCount];
+        item.advertiser = kAdvertisers[i % kAdvertiserCount];
+        item.base_score = 0.05 + 0.95 * static_cast<double>(i % 20) / 19.0;
+        item.created_at = now - std::chrono::hours{static_cast<int>(i % 240)};
+        item.expires_at = lrd::rank::from_epoch_millis(0);
+        items.push_back(std::move(item));
     }
-    return value;
+    return items;
+}
+
+/// A signal with a few category affinities, matching the shape a real client
+/// would send.
+[[nodiscard]] inline lrd::rank::UserSignal make_signal() {
+    lrd::rank::UserSignal signal;
+    signal.affinities = {{"tech", 0.9}, {"sport", 0.5}, {"travel", 0.2}};
+    return signal;
+}
+
+[[nodiscard]] inline lrd::rank::Timestamp bench_now() {
+    return std::chrono::time_point_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now());
 }
 
 }  // namespace lrd::bench

@@ -3,6 +3,7 @@
 #include "lrd/proto/framing.hpp"
 
 #include <format>
+#include <stdexcept>
 #include <utility>
 
 namespace lrd::client {
@@ -22,9 +23,8 @@ const char* to_string(CallStatus status) noexcept {
 Connection::Connection(net::UnixStream stream, std::string_view codec_name)
     : stream_(std::move(stream)), codec_(proto::make_codec(codec_name)) {
     if (!codec_) {
-        throw std::invalid_argument(
-            std::format("unknown codec '{}'; available: {}", codec_name,
-                        proto::available_codecs()));
+        throw std::invalid_argument(std::format("unknown codec '{}'; available: {}", codec_name,
+                                                proto::available_codecs()));
     }
 }
 
@@ -61,17 +61,14 @@ CallStatus Connection::call(const proto::Request& request, proto::Response& resp
 
     if (const proto::DecodeError error = codec_->decode(read_buffer_, response);
         error != proto::DecodeError::None) {
-        // The daemon sent something we cannot parse. Same reasoning as the
-        // daemon's own framing errors: the stream can no longer be trusted.
         stream_.close();
         return fail(CallStatus::ProtocolError,
                     std::format("decode failed: {}", proto::to_string(error)));
     }
 
-    // This is what request_id is for. With one request in flight it is only a
-    // consistency check, but it becomes load bearing the moment responses may
-    // arrive out of order - and a mismatch here means a desynchronised stream,
-    // which is far better caught than acted upon.
+    // What request_id is for. With one request in flight it is a consistency
+    // check; it becomes load bearing the moment responses may arrive out of
+    // order, and a mismatch means a desynchronised stream.
     if (response.request_id != request.request_id) {
         stream_.close();
         return fail(CallStatus::ProtocolError,
@@ -79,100 +76,142 @@ CallStatus Connection::call(const proto::Request& request, proto::Response& resp
                                 response.request_id, request.request_id));
     }
 
-    if (response.type == proto::MessageType::ErrorResponse) {
-        const CallStatus status = (response.status == proto::StatusCode::InvalidRequest)
+    if (const auto* failure = std::get_if<proto::Failure>(&response.body); failure != nullptr) {
+        const CallStatus status = (failure->status == proto::StatusCode::InvalidRequest)
                                       ? CallStatus::InvalidRequest
                                       : CallStatus::ServerError;
-        return fail(status, response.value);
+        return fail(status, failure->message);
     }
 
     return CallStatus::Ok;
 }
 
-CallStatus Connection::get(std::string_view key, std::string& value) {
+template <typename Expected>
+const Expected* Connection::expect(const proto::Response& response, CallStatus& status) {
+    const Expected* result = std::get_if<Expected>(&response.body);
+    if (result == nullptr) {
+        status = fail(CallStatus::ProtocolError,
+                      std::format("unexpected reply type {}",
+                                  proto::to_string(proto::type_of(response.body))));
+        return nullptr;
+    }
+    return result;
+}
+
+CallStatus Connection::put_item(const rank::Item& item) {
+    // Checked client-side as well as server-side. The daemon enforces these
+    // regardless - it cannot trust us - but failing here saves a round trip and
+    // names the caller's own mistake.
+    if (item.category.size() > proto::kMaxCategoryLength) {
+        return fail(CallStatus::InvalidRequest,
+                    std::format("category is {} bytes, limit is {}", item.category.size(),
+                                proto::kMaxCategoryLength));
+    }
+    if (item.advertiser.size() > proto::kMaxAdvertiserLength) {
+        return fail(CallStatus::InvalidRequest,
+                    std::format("advertiser is {} bytes, limit is {}", item.advertiser.size(),
+                                proto::kMaxAdvertiserLength));
+    }
+
     proto::Request request;
-    request.type = proto::MessageType::GetRequest;
     request.request_id = next_request_id_++;
-    request.key = std::string(key);
+    request.body = proto::PutItem{item};
 
     proto::Response response;
     if (const CallStatus status = call(request, response); status != CallStatus::Ok) {
         return status;
     }
-    if (response.type != proto::MessageType::GetResponse) {
-        return fail(CallStatus::ProtocolError,
-                    std::format("expected GetResponse, got {}", proto::to_string(response.type)));
+    CallStatus status = CallStatus::Ok;
+    if (expect<proto::PutItemResult>(response, status) == nullptr) {
+        return status;
     }
-    if (response.status == proto::StatusCode::NotFound) {
+    return CallStatus::Ok;
+}
+
+CallStatus Connection::get_item(rank::ItemId id, rank::Item& item) {
+    proto::Request request;
+    request.request_id = next_request_id_++;
+    request.body = proto::GetItem{id};
+
+    proto::Response response;
+    if (const CallStatus status = call(request, response); status != CallStatus::Ok) {
+        return status;
+    }
+
+    CallStatus status = CallStatus::Ok;
+    const auto* result = expect<proto::GetItemResult>(response, status);
+    if (result == nullptr) {
+        return status;
+    }
+    if (result->status == proto::StatusCode::NotFound) {
         return CallStatus::NotFound;
     }
 
-    value = std::move(response.value);
+    item = result->item;
     return CallStatus::Ok;
 }
 
-CallStatus Connection::put(std::string_view key, std::string_view value) {
-    // Checked client-side as well as server-side. The daemon enforces these
-    // limits regardless - it cannot trust us - but failing here saves a round
-    // trip and gives a message that names the caller's own mistake.
-    if (key.size() > proto::kMaxKeyLength) {
+CallStatus Connection::delete_item(rank::ItemId id) {
+    proto::Request request;
+    request.request_id = next_request_id_++;
+    request.body = proto::DeleteItem{id};
+
+    proto::Response response;
+    if (const CallStatus status = call(request, response); status != CallStatus::Ok) {
+        return status;
+    }
+
+    CallStatus status = CallStatus::Ok;
+    const auto* result = expect<proto::DeleteItemResult>(response, status);
+    if (result == nullptr) {
+        return status;
+    }
+    return result->status == proto::StatusCode::NotFound ? CallStatus::NotFound : CallStatus::Ok;
+}
+
+CallStatus Connection::recommend(const rank::UserSignal& signal, std::uint32_t count,
+                                 std::vector<rank::RankedItem>& items, bool dry_run) {
+    if (count == 0 || count > proto::kMaxRecommendCount) {
         return fail(CallStatus::InvalidRequest,
-                    std::format("key is {} bytes, limit is {}", key.size(), proto::kMaxKeyLength));
-    }
-    if (value.size() > proto::kMaxValueLength) {
-        return fail(CallStatus::InvalidRequest, std::format("value is {} bytes, limit is {}",
-                                                            value.size(), proto::kMaxValueLength));
+                    std::format("count must be between 1 and {}", proto::kMaxRecommendCount));
     }
 
     proto::Request request;
-    request.type = proto::MessageType::PutRequest;
     request.request_id = next_request_id_++;
-    request.key = std::string(key);
-    request.value = std::string(value);
+    request.body = proto::Recommend{signal, count, dry_run};
 
     proto::Response response;
     if (const CallStatus status = call(request, response); status != CallStatus::Ok) {
         return status;
     }
-    if (response.type != proto::MessageType::PutResponse) {
-        return fail(CallStatus::ProtocolError,
-                    std::format("expected PutResponse, got {}", proto::to_string(response.type)));
+
+    CallStatus status = CallStatus::Ok;
+    const auto* result = expect<proto::RecommendResult>(response, status);
+    if (result == nullptr) {
+        return status;
     }
+
+    items = result->items;
     return CallStatus::Ok;
-}
-
-CallStatus Connection::remove(std::string_view key) {
-    proto::Request request;
-    request.type = proto::MessageType::DeleteRequest;
-    request.request_id = next_request_id_++;
-    request.key = std::string(key);
-
-    proto::Response response;
-    if (const CallStatus status = call(request, response); status != CallStatus::Ok) {
-        return status;
-    }
-    if (response.type != proto::MessageType::DeleteResponse) {
-        return fail(CallStatus::ProtocolError, std::format("expected DeleteResponse, got {}",
-                                                           proto::to_string(response.type)));
-    }
-    return response.status == proto::StatusCode::NotFound ? CallStatus::NotFound : CallStatus::Ok;
 }
 
 CallStatus Connection::fetch_stats(proto::Stats& stats) {
     proto::Request request;
-    request.type = proto::MessageType::StatsRequest;
     request.request_id = next_request_id_++;
+    request.body = proto::GetStats{};
 
     proto::Response response;
     if (const CallStatus status = call(request, response); status != CallStatus::Ok) {
         return status;
     }
-    if (response.type != proto::MessageType::StatsResponse) {
-        return fail(CallStatus::ProtocolError,
-                    std::format("expected StatsResponse, got {}", proto::to_string(response.type)));
+
+    CallStatus status = CallStatus::Ok;
+    const auto* result = expect<proto::StatsResult>(response, status);
+    if (result == nullptr) {
+        return status;
     }
 
-    stats = response.stats;
+    stats = result->stats;
     return CallStatus::Ok;
 }
 

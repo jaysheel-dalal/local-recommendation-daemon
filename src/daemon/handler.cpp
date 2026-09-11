@@ -1,98 +1,132 @@
 #include "lrd/daemon/handler.hpp"
 
+#include <chrono>
 #include <format>
 #include <utility>
 
 namespace lrd::daemon {
 
-using proto::MessageType;
-using proto::Response;
+using proto::ResponseBody;
 using proto::StatusCode;
 
 namespace {
-// Pure counters: nothing reads them to decide anything, so there is no
-// happens-before relationship to establish and no reason to pay for one.
+
 constexpr std::memory_order kCount = std::memory_order_relaxed;
-}  // namespace
 
-Response Handler::handle(const proto::Request& request) {
-    requests_.fetch_add(1, kCount);
-
-    switch (request.type) {
-        case MessageType::GetRequest:
-            return handle_get(request);
-        case MessageType::PutRequest:
-            return handle_put(request);
-        case MessageType::DeleteRequest:
-            return handle_delete(request);
-        case MessageType::StatsRequest:
-            return handle_stats(request);
-        default:
-            // The codec rejects response types before we get here, so this is
-            // unreachable in practice - but a handler that returns a valid
-            // response on every path is easier to reason about than one with an
-            // implicit "cannot happen".
-            return proto::make_error(request.request_id, StatusCode::InvalidRequest,
-                                     std::format("unexpected message type {}",
-                                                 proto::to_string(request.type)));
-    }
+rank::Timestamp wall_clock_now() {
+    return std::chrono::time_point_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now());
 }
 
-Response Handler::handle_get(const proto::Request& request) {
-    gets_.fetch_add(1, kCount);
+}  // namespace
 
-    Response response;
-    response.type = MessageType::GetResponse;
+Handler::Handler(std::size_t capacity, std::size_t shard_count, rank::ScoringConfig scoring,
+                 rank::Timestamp (*clock)())
+    : cache_(capacity, shard_count),
+      scoring_(std::move(scoring)),
+      clock_(clock != nullptr ? clock : &wall_clock_now) {}
+
+proto::Response Handler::handle(const proto::Request& request) {
+    requests_.fetch_add(1, kCount);
+
+    proto::Response response;
     response.request_id = request.request_id;
 
-    // The cache's mutex is taken and released entirely within this call.
-    const auto value = cache_.get(request.key);
-    if (!value) {
+    // std::visit over the request variant. The win over a switch on a type enum
+    // is that adding an alternative to RequestBody makes this fail to compile
+    // until it is handled, rather than falling into a default case at runtime.
+    response.body = std::visit(
+        proto::Overloaded{
+            [this](const proto::GetItem& get) { return on_get(get); },
+            [this](const proto::PutItem& put) { return on_put(put); },
+            [this](const proto::DeleteItem& del) { return on_delete(del); },
+            [this](const proto::GetStats&) { return on_stats(); },
+            [this](const proto::Recommend& recommend) { return on_recommend(recommend); },
+        },
+        request.body);
+
+    return response;
+}
+
+ResponseBody Handler::on_get(const proto::GetItem& request) {
+    gets_.fetch_add(1, kCount);
+
+    // get(), not peek(): a direct lookup by id *is* a use, and should keep the
+    // item alive in the cache. The scan inside on_recommend is the opposite case
+    // and uses a non-mutating traversal.
+    const auto item = cache_.get(request.item_id);
+    if (!item) {
         misses_.fetch_add(1, kCount);
-        response.status = StatusCode::NotFound;
-        return response;
+        return proto::GetItemResult{StatusCode::NotFound, {}};
     }
 
     hits_.fetch_add(1, kCount);
-    response.status = StatusCode::Ok;
-    // This copy happens with no lock held. That is precisely why the cache
-    // hands out a shared_ptr instead of the value: copying a 400 KB payload
-    // inside the critical section would stall every other worker behind it.
-    response.value = *value;
-    return response;
+    // The copy happens with no lock held - the reason the cache hands out a
+    // shared_ptr rather than the value.
+    return proto::GetItemResult{StatusCode::Ok, *item};
 }
 
-Response Handler::handle_put(const proto::Request& request) {
+ResponseBody Handler::on_put(const proto::PutItem& request) {
     puts_.fetch_add(1, kCount);
 
-    Response response;
-    response.type = MessageType::PutResponse;
-    response.request_id = request.request_id;
-
-    if (request.key.empty()) {
-        // An empty key is rejected rather than accepted as a valid entry: it is
-        // almost always a client bug, and allowing it makes cache dumps
-        // ambiguous to read.
-        return proto::make_error(request.request_id, StatusCode::InvalidRequest,
-                                 "key must not be empty");
+    if (request.item.id == 0) {
+        // Zero is reserved as "unset", so accepting it would make an unset id
+        // indistinguishable from a real one in every later lookup.
+        return proto::Failure{StatusCode::InvalidRequest, "item id must not be zero"};
+    }
+    if (request.item.category.empty()) {
+        // Ranking keys affinity off the category; an empty one can never match a
+        // signal and would only ever be served at the default affinity.
+        return proto::Failure{StatusCode::InvalidRequest, "item category must not be empty"};
     }
 
-    // May evict the least-recently-used entry. A PUT that succeeds is therefore
-    // not a promise that a later GET will hit - the defining difference between
-    // a cache and a store, and something a client has to be written to expect.
-    cache_.put(request.key, request.value);
-    response.status = StatusCode::Ok;
-    return response;
+    // May evict the least-recently-used entry in this item's shard. A successful
+    // PutItem is therefore not a promise that a later GetItem will hit.
+    cache_.put(request.item.id, request.item);
+    return proto::PutItemResult{StatusCode::Ok};
 }
 
-Response Handler::handle_delete(const proto::Request& request) {
+ResponseBody Handler::on_delete(const proto::DeleteItem& request) {
     deletes_.fetch_add(1, kCount);
+    return proto::DeleteItemResult{cache_.erase(request.item_id) ? StatusCode::Ok
+                                                                 : StatusCode::NotFound};
+}
 
-    Response response;
-    response.type = MessageType::DeleteResponse;
-    response.request_id = request.request_id;
-    response.status = cache_.erase(request.key) ? StatusCode::Ok : StatusCode::NotFound;
-    return response;
+ResponseBody Handler::on_recommend(const proto::Recommend& request) {
+    recommends_.fetch_add(1, kCount);
+
+    if (request.count == 0) {
+        return proto::Failure{StatusCode::InvalidRequest, "count must be at least 1"};
+    }
+    if (request.count > proto::kMaxRecommendCount) {
+        return proto::Failure{StatusCode::InvalidRequest,
+                              std::format("count {} exceeds the limit of {}", request.count,
+                                          proto::kMaxRecommendCount)};
+    }
+
+    const rank::Timestamp now = clock_();
+    rank::CandidateSelector selector(scoring_, request.signal, now, request.count);
+
+    // Shard by shard, so a lock is held only for the duration of one shard's
+    // pointer copy - never while scoring. Scoring thousands of candidates under
+    // a cache lock would serialise every other worker behind this request.
+    //
+    // The buffer is declared outside the loop and reused, so the allocation is
+    // bounded by the largest shard rather than repeated per shard.
+    std::vector<std::pair<rank::ItemId, decltype(cache_)::ValuePtr>> batch;
+    for (std::size_t shard = 0; shard < cache_.shard_count(); ++shard) {
+        cache_.snapshot_shard(shard, batch);
+        for (const auto& [id, item] : batch) {
+            selector.consider(*item);
+        }
+    }
+
+    // dry_run is inert here: step 9 records nothing, so every recommendation is
+    // effectively a dry run. Step 10 gives it meaning by having a non-dry-run
+    // recommendation reserve exposure against each returned item's cap.
+    (void)request.dry_run;
+
+    return proto::RecommendResult{StatusCode::Ok, selector.select()};
 }
 
 proto::Stats Handler::stats() const {
@@ -101,24 +135,19 @@ proto::Stats Handler::stats() const {
     stats.gets = gets_.load(kCount);
     stats.puts = puts_.load(kCount);
     stats.deletes = deletes_.load(kCount);
+    stats.recommends = recommends_.load(kCount);
     stats.hits = hits_.load(kCount);
     stats.misses = misses_.load(kCount);
-    // Cache-owned numbers are read at reporting time rather than mirrored into
-    // our counters on every operation: one source of truth, and no chance of
-    // the two drifting apart.
+    // Cache-owned numbers read at reporting time rather than mirrored into our
+    // counters on every operation: one source of truth, no chance of drift.
     stats.evictions = cache_.metrics().evictions;
     stats.entries = cache_.size();
     stats.capacity = cache_.capacity();
     return stats;
 }
 
-Response Handler::handle_stats(const proto::Request& request) const {
-    Response response;
-    response.type = MessageType::StatsResponse;
-    response.request_id = request.request_id;
-    response.status = StatusCode::Ok;
-    response.stats = stats();
-    return response;
+ResponseBody Handler::on_stats() const {
+    return proto::StatsResult{StatusCode::Ok, stats()};
 }
 
 }  // namespace lrd::daemon
