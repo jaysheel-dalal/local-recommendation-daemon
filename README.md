@@ -49,8 +49,8 @@ milestone.
 | 8 | ProtobufCodec behind the Phase 1 seam, benchmarked | ✅ done |
 | 9 | Item metadata + candidate ranking | ✅ done |
 | 10 | Compliance: exposure cap, frequency limit | ✅ done |
-| 11 | Client SDK | ⏳ next |
-| 12 | Privacy: noise on exported metrics | — |
+| 11 | Client SDK | ✅ done |
+| 12 | Privacy: noise on exported metrics | ⏳ next |
 
 Phase 2 (candidate ranking, exposure/frequency policy, client SDK, privacy
 noise) begins once step 7 lands.
@@ -187,6 +187,30 @@ shards the cache (step 7). The alternatives — CLOCK, sampled eviction,
 sharding, lock-free — are each written up with their real costs in
 `docs/concurrency.md`.
 
+**The SDK is verified to stand alone, not just claimed to.**
+`scripts/verify-sdk-install.sh` installs it to a throwaway prefix and builds
+`examples/recommender_app.cpp` from a separate directory via `find_package(lrd)`,
+with no access to this source tree. A consumer sees exactly four headers — the
+client, its status type, and the two data types — and no socket, codec, framing
+or protobuf. Writing that script caught two real export bugs: a build-tree
+`ALIAS` is not exported (`EXPORT_NAME` is the separate property that fixes it),
+and CMake refuses to export a target carrying a bare source-tree include path.
+
+**Which operations the SDK retries is a compliance question, not a networking
+one.** A recording `recommend()` reserves exposure against every item it returns.
+If the connection dies after the daemon processed the request but before the
+reply arrived, the work is done — and a retry charges those caps twice. That is
+at-least-once versus at-most-once, and without daemon-side deduplication an SDK
+cannot have both, so it picks at-most-once for the operation with a side effect
+and reports the loss. Reads, `put_item` and `preview()` are retried freely. What
+would let you have both is request-id dedup in the daemon, sketched honestly in
+[`docs/sdk.md`](docs/sdk.md) rather than hand-waved.
+
+**A failed connection is dropped, never returned to the pool.** A failed call may
+have left half a frame on the wire; recycling that connection would hand the next
+caller a stream whose next read is the tail of someone else's message. Tested by
+killing the daemon under a live client and restarting it.
+
 **Compliance state is per-item, and that falls out of being on-device.** A
 frequency cap is normally "N shows per *user* per hour", which needs a user
 identifier — exactly what the signal deliberately does not carry. But the daemon
@@ -311,6 +335,7 @@ src/             implementation, mirroring include/
   client/        client library — becomes the SDK in Phase 2
 bench/           load generator and latency reporter
 tests/           dependency-free harness + CTest entries
-docs/            protocol spec, concurrency, benchmarks, ranking, policy
+examples/        an app consuming the SDK and nothing else
+docs/            protocol, concurrency, benchmarks, ranking, policy, sdk
 scripts/         build and smoke helpers
 ```

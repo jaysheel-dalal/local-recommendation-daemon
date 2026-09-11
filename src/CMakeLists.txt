@@ -16,7 +16,13 @@ if(LRD_WITH_PROTOBUF)
     add_library(lrd_proto_gen STATIC ${LRD_PROTO_SRCS} ${LRD_PROTO_HDRS})
 
     # SYSTEM: suppresses generated-header warnings for every consumer.
-    target_include_directories(lrd_proto_gen SYSTEM PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
+    #
+    # BUILD_INTERFACE only, with no INSTALL_INTERFACE: the generated headers are
+    # an implementation detail and are not installed, so an installed consumer
+    # must never be told to look for them. An exported target carrying a raw
+    # build-tree path is an error CMake catches at generate time.
+    target_include_directories(lrd_proto_gen SYSTEM PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>)
     target_link_libraries(lrd_proto_gen PUBLIC protobuf::libprotobuf)
 endif()
 
@@ -43,8 +49,12 @@ add_library(lrd_core STATIC
 # PUBLIC on the include dir: anything linking lrd_core also gets include/ on its
 # header search path. That is why tests and bench can #include <lrd/...> without
 # repeating this line.
+# BUILD_INTERFACE / INSTALL_INTERFACE rather than a bare path: the two differ
+# once the target is exported, and CMake refuses to export a target that names a
+# source-tree directory a consumer will not have.
 target_include_directories(lrd_core PUBLIC
-    "${CMAKE_SOURCE_DIR}/include")
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
 
 # LRD_VERSION comes from project(... VERSION) so the version lives in exactly
 # one place. PRIVATE: only lrd_core's own sources need it.
@@ -88,6 +98,37 @@ add_library(lrd_daemon STATIC
 target_link_libraries(lrd_daemon
     PUBLIC lrd_core
     PRIVATE lrd_options)
+
+# ---------------------------------------------------------------------------
+# lrd_sdk - the public library other applications link against.
+#
+# Linked PRIVATE against lrd_client and lrd_core: a consumer gets the SDK's
+# headers and nothing else. That is the whole point - if this were PUBLIC, every
+# consumer would inherit the protocol and transport headers on their include
+# path and the pimpl would be decorative.
+# ---------------------------------------------------------------------------
+add_library(lrd_sdk STATIC
+    sdk/client.cpp)
+
+target_include_directories(lrd_sdk PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+
+target_link_libraries(lrd_sdk
+    PRIVATE lrd_client lrd_core lrd_options)
+
+# Consumers still need a threading runtime at link time even though they never
+# see a thread in the API.
+target_link_libraries(lrd_sdk PUBLIC Threads::Threads)
+
+# Two different things, both needed:
+#   ALIAS gives `lrd::sdk` inside this build tree (used by examples/).
+#   EXPORT_NAME gives `lrd::sdk` to an *installed* consumer - without it the
+#   exported target is `lrd::lrd_sdk`, because the export namespace is prefixed
+#   onto the raw target name. An ALIAS is not exported, so the two are unrelated
+#   and it is entirely possible to have one and not the other.
+add_library(lrd::sdk ALIAS lrd_sdk)
+set_target_properties(lrd_sdk PROPERTIES EXPORT_NAME sdk)
 
 # ---------------------------------------------------------------------------
 # Binaries.

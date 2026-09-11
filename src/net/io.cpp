@@ -56,6 +56,19 @@ IoResult read_exact(int fd, void* buffer, std::size_t size) noexcept {
             continue;
         }
 
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // SO_RCVTIMEO elapsed. Deliberately *not* retried: the point of
+            // setting a timeout is that the caller wanted to stop waiting, and
+            // looping here would silently restore the unbounded wait it was
+            // configured to avoid.
+            //
+            // EAGAIN and EWOULDBLOCK are the same value on Linux but are not
+            // required to be, so both are named.
+            result.status = IoStatus::TimedOut;
+            result.error = errno;
+            return result;
+        }
+
         result.status = IoStatus::Error;
         result.error = errno;
         return result;
@@ -79,6 +92,11 @@ IoResult read_some(int fd, void* buffer, std::size_t size) noexcept {
         }
         if (errno == EINTR) {
             continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            result.status = IoStatus::TimedOut;
+            result.error = errno;
+            return result;
         }
         result.status = IoStatus::Error;
         result.error = errno;
@@ -122,6 +140,14 @@ IoResult write_all(int fd, const void* buffer, std::size_t size) noexcept {
             // The peer is gone. Routine, not a fault: report it the same way
             // as a clean read-side shutdown so callers have one case to handle.
             result.status = IoStatus::PeerClosed;
+            return result;
+        }
+
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // SO_SNDTIMEO elapsed - the send buffer stayed full longer than the
+            // caller was willing to wait.
+            result.status = IoStatus::TimedOut;
+            result.error = errno;
             return result;
         }
 

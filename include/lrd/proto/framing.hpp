@@ -26,6 +26,16 @@ enum class FrameStatus : std::uint8_t {
     PeerClosed,
     Truncated,
     Oversized,
+
+    /// A socket timeout elapsed.
+    ///
+    /// Always fatal to the connection, even when it happened *between* frames
+    /// with nothing consumed. The reason is that the daemon may still be about
+    /// to send the response we gave up waiting for: reusing the connection would
+    /// read that stale reply as the answer to the *next* request, and every
+    /// reply after it would be off by one. Hanging up is the only way to be sure.
+    TimedOut,
+
     IoError,
 };
 

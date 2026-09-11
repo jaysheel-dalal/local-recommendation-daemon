@@ -30,6 +30,10 @@ FrameResult from_io(const net::IoResult& io) noexcept {
             // different situations, which is why IoResult carries `transferred`.
             result.status = (io.transferred == 0) ? FrameStatus::PeerClosed : FrameStatus::Truncated;
             break;
+        case net::IoStatus::TimedOut:
+            result.status = FrameStatus::TimedOut;
+            result.io_error = io.error;
+            break;
         case net::IoStatus::Error:
             result.status = FrameStatus::IoError;
             result.io_error = io.error;
@@ -46,6 +50,7 @@ const char* to_string(FrameStatus status) noexcept {
         case FrameStatus::PeerClosed: return "PeerClosed";
         case FrameStatus::Truncated: return "Truncated";
         case FrameStatus::Oversized: return "Oversized";
+        case FrameStatus::TimedOut: return "TimedOut";
         case FrameStatus::IoError: return "IoError";
     }
     return "Unknown";

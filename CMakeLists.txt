@@ -106,5 +106,64 @@ if(LRD_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
+option(LRD_BUILD_EXAMPLES "Build the SDK example application" ON)
+if(LRD_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
+
+# ---------------------------------------------------------------------------
+# Install and export.
+#
+# What makes `find_package(lrd)` work for a consumer outside this tree, and what
+# turns "the SDK is self-contained" from a claim into something checkable -
+# scripts/verify-sdk-install.sh installs to a throwaway prefix and builds the
+# example against it with no access to these sources.
+#
+# Only the SDK and the libraries it is built from are installed. lrdd, lrd_cli
+# and the benchmarks are ours, not a consumer's.
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+set(LRD_INSTALL_TARGETS lrd_sdk lrd_client lrd_core lrd_options)
+if(LRD_WITH_PROTOBUF)
+    list(APPEND LRD_INSTALL_TARGETS lrd_proto_gen)
+endif()
+
+install(TARGETS ${LRD_INSTALL_TARGETS}
+    EXPORT lrdTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# The public headers. Deliberately a curated list rather than the whole include
+# tree: installing everything would ship the transport and protocol headers and
+# quietly make them part of the supported surface.
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/include/lrd/sdk"
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/lrd)
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/include/lrd/rank"
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/lrd
+        FILES_MATCHING PATTERN "item.hpp" PATTERN "signal.hpp")
+
+install(EXPORT lrdTargets
+    FILE lrdTargets.cmake
+    NAMESPACE lrd::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/lrd)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/lrdConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+
+configure_package_config_file(
+    "${CMAKE_SOURCE_DIR}/cmake/lrdConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/lrdConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/lrd)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/lrdConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/lrdConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/lrd)
+
 message(STATUS "lrd ${PROJECT_VERSION} | ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} "
                "| C++${CMAKE_CXX_STANDARD} | ${CMAKE_BUILD_TYPE} | sanitizer=${LRD_SANITIZER}")

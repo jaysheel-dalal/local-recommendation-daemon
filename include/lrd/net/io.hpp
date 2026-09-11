@@ -8,7 +8,18 @@ namespace lrd::net {
 enum class IoStatus : std::uint8_t {
     Ok,          ///< The full requested byte count was transferred.
     PeerClosed,  ///< The peer performed an orderly shutdown mid-transfer.
-    Error,       ///< A syscall failed; see IoResult::error for the errno value.
+
+    /// A socket timeout elapsed (SO_RCVTIMEO / SO_SNDTIMEO).
+    ///
+    /// Distinct from Error because the socket is still perfectly healthy - the
+    /// peer was merely slow. What makes it dangerous is `transferred`: a timeout
+    /// part-way through a message leaves the stream desynchronised, because the
+    /// bytes already consumed cannot be put back. Callers must treat a
+    /// mid-message timeout as fatal to the connection even though nothing is
+    /// broken at the socket level.
+    TimedOut,
+
+    Error,  ///< A syscall failed; see IoResult::error for the errno value.
 };
 
 /// Result of a whole-buffer transfer.

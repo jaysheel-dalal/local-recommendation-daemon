@@ -3,6 +3,7 @@
 #include "lrd/common/fd.hpp"
 #include "lrd/net/io.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <string>
 #include <string_view>
@@ -50,6 +51,17 @@ public:
     IoResult read_some(void* buffer, std::size_t size) noexcept {
         return net::read_some(fd_.get(), buffer, size);
     }
+
+    /// Applies receive and send timeouts to this socket.
+    ///
+    /// A zero duration means "no timeout", which is the socket default and what
+    /// the daemon uses - a worker blocked on the client it is dedicated to has
+    /// nothing better to do, and shutdown interrupts it by other means (see
+    /// ConnectionRegistry). The SDK sets them, because a library that can hang a
+    /// caller's thread indefinitely is not shippable.
+    ///
+    /// Throws SystemError if the option cannot be set.
+    void set_timeouts(std::chrono::milliseconds receive, std::chrono::milliseconds send);
 
     /// Half-closes the write side, so the peer's next read returns 0 and it
     /// learns we are done. Distinct from closing: we can still read whatever

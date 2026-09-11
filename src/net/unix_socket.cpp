@@ -5,6 +5,7 @@
 
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -104,6 +105,25 @@ UnixStream UnixStream::connect(std::string_view path) {
     }
 
     return UnixStream(std::move(fd));
+}
+
+void UnixStream::set_timeouts(std::chrono::milliseconds receive, std::chrono::milliseconds send) {
+    const auto apply = [this](int option, std::chrono::milliseconds duration, const char* name) {
+        // struct timeval, not milliseconds: setsockopt predates chrono by some
+        // decades. Splitting into whole seconds plus microseconds is the entire
+        // conversion, and getting it wrong by a factor of 1000 is the classic
+        // way a timeout silently becomes useless.
+        timeval value{};
+        value.tv_sec = static_cast<time_t>(duration.count() / 1000);
+        value.tv_usec = static_cast<suseconds_t>((duration.count() % 1000) * 1000);
+
+        if (::setsockopt(fd_.get(), SOL_SOCKET, option, &value, sizeof(value)) != 0) {
+            throw_errno(name);
+        }
+    };
+
+    apply(SO_RCVTIMEO, receive, "setsockopt(SO_RCVTIMEO)");
+    apply(SO_SNDTIMEO, send, "setsockopt(SO_SNDTIMEO)");
 }
 
 void UnixStream::shutdown_write() noexcept {
