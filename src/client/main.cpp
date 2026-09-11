@@ -203,6 +203,18 @@ int cmd_stats(Connection& connection) {
                 static_cast<unsigned long long>(stats.entries),
                 static_cast<unsigned long long>(stats.capacity),
                 pct(stats.entries, stats.capacity));
+
+    std::printf("\ncompliance\n"
+                "  allowed            %llu\n"
+                "  exposure blocked   %llu\n"
+                "  frequency blocked  %llu\n"
+                "  store full         %llu\n"
+                "  items tracked      %llu\n",
+                static_cast<unsigned long long>(stats.policy_allowed),
+                static_cast<unsigned long long>(stats.policy_exposure_blocked),
+                static_cast<unsigned long long>(stats.policy_frequency_blocked),
+                static_cast<unsigned long long>(stats.policy_store_full),
+                static_cast<unsigned long long>(stats.policy_tracked));
     return 0;
 }
 

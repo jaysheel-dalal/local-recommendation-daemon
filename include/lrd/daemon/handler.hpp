@@ -1,6 +1,7 @@
 #pragma once
 
 #include "lrd/cache/sharded_cache.hpp"
+#include "lrd/policy/exposure_store.hpp"
 #include "lrd/proto/message.hpp"
 #include "lrd/rank/item.hpp"
 #include "lrd/rank/scorer.hpp"
@@ -48,7 +49,7 @@ public:
     /// to return one. A function pointer rather than std::function because the
     /// clock is called once per recommendation and carries no state.
     Handler(std::size_t capacity, std::size_t shard_count, rank::ScoringConfig scoring = {},
-            rank::Timestamp (*clock)() = nullptr);
+            policy::PolicyConfig policy = {}, rank::Timestamp (*clock)() = nullptr);
 
     [[nodiscard]] proto::Response handle(const proto::Request& request);
 
@@ -62,6 +63,13 @@ private:
     [[nodiscard]] proto::ResponseBody on_recommend(const proto::Recommend& request);
 
     cache::ShardedCache<rank::ItemId, rank::Item> cache_;
+
+    /// Compliance counters, sharded the same way and with the same hash mixing
+    /// as the item cache - so an item's counters and the item itself sit in
+    /// corresponding shards, which keeps the two lock domains parallel even
+    /// though they are never held at the same time.
+    policy::ExposureStore policy_;
+
     rank::ScoringConfig scoring_;
     rank::Timestamp (*clock_)() = nullptr;
 

@@ -2,6 +2,7 @@
 
 #include "lrd/cache/locked_cache.hpp"
 #include "lrd/cache/lru_cache.hpp"
+#include "lrd/common/hash_mix.hpp"
 
 #include <bit>
 #include <cstddef>
@@ -173,7 +174,7 @@ public:
     }
 
     [[nodiscard]] std::size_t shard_index(const Key& key) const {
-        return mix(hasher_(key)) & mask_;
+        return hash_mix(hasher_(key)) & mask_;
     }
 
 private:
@@ -197,19 +198,6 @@ private:
         explicit Shard(std::size_t capacity) : cache(capacity) {}
         Underlying cache;
     };
-
-    /// splitmix64's finalizer: avalanches every input bit across the whole
-    /// word, so the low bits we mask are well distributed even when the
-    /// incoming hash is weak or, as with std::hash<int>, absent entirely.
-    [[nodiscard]] static std::size_t mix(std::size_t hash) noexcept {
-        auto value = static_cast<std::uint64_t>(hash);
-        value ^= value >> 30;
-        value *= 0xBF58476D1CE4E5B9ULL;
-        value ^= value >> 27;
-        value *= 0x94D049BB133111EBULL;
-        value ^= value >> 31;
-        return static_cast<std::size_t>(value);
-    }
 
     [[nodiscard]] Underlying& shard_for(const Key& key) {
         return shards_[shard_index(key)]->cache;

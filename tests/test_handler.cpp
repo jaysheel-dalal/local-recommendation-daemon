@@ -1,9 +1,12 @@
 #include "lrd/daemon/handler.hpp"
+#include "lrd/policy/policy.hpp"
 
 #include "test_harness.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <thread>
 #include <string>
 #include <variant>
 #include <vector>
@@ -29,8 +32,9 @@ rank::Timestamp fixed_now() {
 /// Returns a prvalue, which C++17 guarantees is constructed directly in the
 /// caller - Handler is neither copyable nor movable (it owns a ShardedCache and
 /// atomics), so anything needing a move here would not compile.
-Handler make_handler(std::size_t capacity = kCapacity, std::size_t shards = kShards) {
-    return Handler(capacity, shards, lrd::rank::ScoringConfig{}, &fixed_now);
+Handler make_handler(std::size_t capacity = kCapacity, std::size_t shards = kShards,
+                     lrd::policy::PolicyConfig policy = {}) {
+    return Handler(capacity, shards, lrd::rank::ScoringConfig{}, policy, &fixed_now);
 }
 
 rank::Item item_of(rank::ItemId id, std::string category, double score,
@@ -329,4 +333,189 @@ LRD_TEST("a put that overflows capacity evicts, and eviction reads as a miss") {
     LRD_CHECK_EQ(stats->stats.evictions, std::uint64_t{1});
     LRD_CHECK_EQ(stats->stats.entries, std::uint64_t{2});
     LRD_CHECK_EQ(stats->stats.capacity, std::uint64_t{2});
+}
+
+// --------------------------------------------------------------------------
+// Compliance (step 10)
+// --------------------------------------------------------------------------
+
+namespace {
+
+lrd::policy::PolicyConfig policy_of(std::uint64_t exposure_cap, std::uint32_t frequency_limit,
+                                    std::size_t tracked = 1024) {
+    lrd::policy::PolicyConfig config;
+    config.exposure_cap = exposure_cap;
+    config.frequency_limit = frequency_limit;
+    config.max_tracked_items = tracked;
+    return config;
+}
+
+std::size_t recommend_count(Handler& handler, std::uint32_t count) {
+    const Response response = handler.handle(recommend_of({{"tech", 1.0}}, count));
+    const auto* result = std::get_if<RecommendResult>(&response.body);
+    return result == nullptr ? 0 : result->items.size();
+}
+
+}  // namespace
+
+LRD_TEST("an item stops being returned once it hits its exposure cap") {
+    // One item, cap of 2. The first two recommendations return it; the third
+    // returns an empty slate because there is nothing else to fall back to.
+    Handler handler = make_handler(kCapacity, kShards, policy_of(2, 0));
+    (void)handler.handle(put_of(item_of(1, "tech", 1.0)));
+
+    LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{1});
+    LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{1});
+    LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{0});
+}
+
+LRD_TEST("a capped item is replaced by the next best, not omitted") {
+    // The reason the policy gate is consulted *during* selection. Item 1 is the
+    // strongest candidate but capped at one show; once it is spent, a slate of
+    // one must still come back full - filled by item 2.
+    Handler handler = make_handler(kCapacity, kShards, policy_of(1, 0));
+    (void)handler.handle(put_of(item_of(1, "tech", 1.0, "a")));
+    (void)handler.handle(put_of(item_of(2, "tech", 0.5, "b")));
+
+    {
+        const Response response = handler.handle(recommend_of({{"tech", 1.0}}, 1));
+        const auto* result = std::get_if<RecommendResult>(&response.body);
+        LRD_REQUIRE(result != nullptr);
+        LRD_REQUIRE(result->items.size() == 1);
+        LRD_CHECK_EQ(result->items[0].id, rank::ItemId{1});
+    }
+    {
+        const Response response = handler.handle(recommend_of({{"tech", 1.0}}, 1));
+        const auto* result = std::get_if<RecommendResult>(&response.body);
+        LRD_REQUIRE(result != nullptr);
+        // Still one item - the slate filled rather than shrank.
+        LRD_REQUIRE(result->items.size() == 1);
+        LRD_CHECK_EQ(result->items[0].id, rank::ItemId{2});
+    }
+}
+
+LRD_TEST("only returned items are charged an exposure") {
+    // Three items, a slate of one, a cap of one each. After three
+    // recommendations all three should be spent - meaning each recommendation
+    // charged exactly the one item it returned, not every item it scored.
+    Handler handler = make_handler(kCapacity, kShards, policy_of(1, 0));
+    for (rank::ItemId id = 1; id <= 3; ++id) {
+        (void)handler.handle(put_of(item_of(id, "tech", 1.0 / static_cast<double>(id),
+                                            "adv-" + std::to_string(id))));
+    }
+
+    LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{1});
+    LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{1});
+    LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{1});
+    LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{0});
+}
+
+LRD_TEST("a dry run reports the same slate without spending it") {
+    // The behaviour the flag has existed for since step 9, now meaningful. Three
+    // dry runs return the same item; a live run then spends it.
+    Handler handler = make_handler(kCapacity, kShards, policy_of(1, 0));
+    (void)handler.handle(put_of(item_of(1, "tech", 1.0)));
+
+    Request dry = recommend_of({{"tech", 1.0}}, 1);
+    std::get<Recommend>(dry.body).dry_run = true;
+
+    for (int i = 0; i < 3; ++i) {
+        const Response response = handler.handle(dry);
+        const auto* result = std::get_if<RecommendResult>(&response.body);
+        LRD_REQUIRE(result != nullptr);
+        LRD_REQUIRE(result->items.size() == 1);
+        LRD_CHECK_EQ(result->items[0].id, rank::ItemId{1});
+    }
+
+    // The cap is still intact, so a live run succeeds - and then exhausts it.
+    LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{1});
+    LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{0});
+
+    // And a dry run now honestly reports that nothing is available.
+    const Response response = handler.handle(dry);
+    const auto* result = std::get_if<RecommendResult>(&response.body);
+    LRD_REQUIRE(result != nullptr);
+    LRD_CHECK(result->items.empty());
+}
+
+LRD_TEST("the frequency limit binds within a window") {
+    Handler handler = make_handler(kCapacity, kShards, policy_of(0, 2));
+    (void)handler.handle(put_of(item_of(1, "tech", 1.0)));
+
+    // The clock is pinned, so every request lands in the same window.
+    LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{1});
+    LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{1});
+    LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{0});
+}
+
+LRD_TEST("deleting and republishing an item does not reset its exposure cap") {
+    // The exploit the handler deliberately does not permit. If DeleteItem cleared
+    // the counters, any client could reset a lifetime cap at will and the cap
+    // would be decorative.
+    Handler handler = make_handler(kCapacity, kShards, policy_of(1, 0));
+    (void)handler.handle(put_of(item_of(1, "tech", 1.0)));
+    LRD_REQUIRE(recommend_count(handler, 1) == 1);
+
+    (void)handler.handle(del_of(1));
+    (void)handler.handle(put_of(item_of(1, "tech", 1.0)));
+
+    LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{0});
+}
+
+LRD_TEST("stats report why items were blocked") {
+    Handler handler = make_handler(kCapacity, kShards, policy_of(1, 0));
+    (void)handler.handle(put_of(item_of(1, "tech", 1.0)));
+
+    (void)recommend_count(handler, 1);  // allowed
+    (void)recommend_count(handler, 1);  // blocked on the cap
+
+    const Response response = handler.handle(stats_of());
+    const auto* stats = std::get_if<StatsResult>(&response.body);
+    LRD_REQUIRE(stats != nullptr);
+    LRD_CHECK_EQ(stats->stats.policy_allowed, std::uint64_t{1});
+    LRD_CHECK_EQ(stats->stats.policy_exposure_blocked, std::uint64_t{1});
+    LRD_CHECK_EQ(stats->stats.policy_tracked, std::uint64_t{1});
+}
+
+LRD_TEST("with no limits configured nothing is blocked") {
+    // The default: caps of zero mean unlimited, so step 9 behaviour is unchanged
+    // for anyone who does not opt in.
+    Handler handler = make_handler();
+    (void)handler.handle(put_of(item_of(1, "tech", 1.0)));
+
+    for (int i = 0; i < 50; ++i) {
+        LRD_CHECK_EQ(recommend_count(handler, 1), std::size_t{1});
+    }
+
+    const Response response = handler.handle(stats_of());
+    const auto* stats = std::get_if<StatsResult>(&response.body);
+    LRD_REQUIRE(stats != nullptr);
+    LRD_CHECK_EQ(stats->stats.policy_exposure_blocked, std::uint64_t{0});
+    LRD_CHECK_EQ(stats->stats.policy_frequency_blocked, std::uint64_t{0});
+}
+
+LRD_TEST("concurrent recommendations never exceed an item's cap") {
+    // End to end through the handler, which is where the cap has to hold: eight
+    // threads asking for recommendations at once, one item, a cap of 50. The
+    // total number of times it is returned must be exactly 50.
+    constexpr std::uint64_t kCap = 50;
+    Handler handler = make_handler(kCapacity, kShards, policy_of(kCap, 0));
+    (void)handler.handle(put_of(item_of(1, "tech", 1.0)));
+
+    std::atomic<std::size_t> returned{0};
+    {
+        std::vector<std::jthread> threads;
+        threads.reserve(8);
+        for (int t = 0; t < 8; ++t) {
+            threads.emplace_back([&] {
+                std::size_t local = 0;
+                for (int i = 0; i < 100; ++i) {
+                    local += recommend_count(handler, 1);
+                }
+                returned.fetch_add(local);
+            });
+        }
+    }
+
+    LRD_CHECK_EQ(returned.load(), static_cast<std::size_t>(kCap));
 }

@@ -21,8 +21,9 @@ rank::Timestamp wall_clock_now() {
 }  // namespace
 
 Handler::Handler(std::size_t capacity, std::size_t shard_count, rank::ScoringConfig scoring,
-                 rank::Timestamp (*clock)())
+                 policy::PolicyConfig policy, rank::Timestamp (*clock)())
     : cache_(capacity, shard_count),
+      policy_(policy, shard_count),
       scoring_(std::move(scoring)),
       clock_(clock != nullptr ? clock : &wall_clock_now) {}
 
@@ -88,6 +89,11 @@ ResponseBody Handler::on_put(const proto::PutItem& request) {
 
 ResponseBody Handler::on_delete(const proto::DeleteItem& request) {
     deletes_.fetch_add(1, kCount);
+
+    // Deliberately does NOT call policy_.forget(). Clearing an item's counters
+    // here would make a lifetime exposure cap trivially resettable: delete the
+    // item, publish it again, and its history is gone. Counters outlive the
+    // items they govern, and the policy store's own bound is what reclaims them.
     return proto::DeleteItemResult{cache_.erase(request.item_id) ? StatusCode::Ok
                                                                  : StatusCode::NotFound};
 }
@@ -121,12 +127,24 @@ ResponseBody Handler::on_recommend(const proto::Recommend& request) {
         }
     }
 
-    // dry_run is inert here: step 9 records nothing, so every recommendation is
-    // effectively a dry run. Step 10 gives it meaning by having a non-dry-run
-    // recommendation reserve exposure against each returned item's cap.
-    (void)request.dry_run;
+    // The compliance gate, consulted during selection rather than after it.
+    //
+    // Live: reserve() checks every limit and records the show in one atomic
+    // step. Nothing reaches a client without passing it, and nothing is charged
+    // an exposure that is not returned.
+    //
+    // Dry run: check() answers the same question without recording. Its answer
+    // is advisory by construction - another thread may take the last slot a
+    // nanosecond later - which is exactly why the live path cannot be a check
+    // followed by a separate record.
+    const bool dry_run = request.dry_run;
+    const auto accept = [this, now, dry_run](rank::ItemId id) {
+        const policy::Decision decision =
+            dry_run ? policy_.check(id, now) : policy_.reserve(id, now);
+        return decision == policy::Decision::Allowed;
+    };
 
-    return proto::RecommendResult{StatusCode::Ok, selector.select()};
+    return proto::RecommendResult{StatusCode::Ok, selector.select(accept)};
 }
 
 proto::Stats Handler::stats() const {
@@ -143,6 +161,13 @@ proto::Stats Handler::stats() const {
     stats.evictions = cache_.metrics().evictions;
     stats.entries = cache_.size();
     stats.capacity = cache_.capacity();
+
+    const policy::PolicyMetrics policy_metrics = policy_.metrics();
+    stats.policy_allowed = policy_metrics.allowed;
+    stats.policy_exposure_blocked = policy_metrics.exposure_blocked;
+    stats.policy_frequency_blocked = policy_metrics.frequency_blocked;
+    stats.policy_store_full = policy_metrics.store_full_blocked;
+    stats.policy_tracked = policy_metrics.tracked;
     return stats;
 }
 

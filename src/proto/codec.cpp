@@ -133,11 +133,11 @@ DecodeError finish(ByteReader& reader) noexcept {
 }  // namespace
 
 std::unique_ptr<Codec> make_codec(std::string_view name) {
-    if (name == "binary" || name == "binary/v2") {
+    if (name == "binary" || name == "binary/v3") {
         return std::make_unique<BinaryCodec>();
     }
 #ifdef LRD_WITH_PROTOBUF
-    if (name == "protobuf" || name == "protobuf/v2") {
+    if (name == "protobuf" || name == "protobuf/v3") {
         return std::make_unique<ProtobufCodec>();
     }
 #endif
@@ -247,6 +247,11 @@ void BinaryCodec::encode(const Response& response, ByteBuffer& out) const {
                        writer.u64(result.stats.evictions);
                        writer.u64(result.stats.entries);
                        writer.u64(result.stats.capacity);
+                       writer.u64(result.stats.policy_allowed);
+                       writer.u64(result.stats.policy_exposure_blocked);
+                       writer.u64(result.stats.policy_frequency_blocked);
+                       writer.u64(result.stats.policy_store_full);
+                       writer.u64(result.stats.policy_tracked);
                    },
                    [&](const RecommendResult& result) {
                        writer.u8(static_cast<std::uint8_t>(result.status));
@@ -373,6 +378,11 @@ DecodeError BinaryCodec::decode(ByteView body, Response& out) const {
             result.stats.evictions = reader.u64();
             result.stats.entries = reader.u64();
             result.stats.capacity = reader.u64();
+            result.stats.policy_allowed = reader.u64();
+            result.stats.policy_exposure_blocked = reader.u64();
+            result.stats.policy_frequency_blocked = reader.u64();
+            result.stats.policy_store_full = reader.u64();
+            result.stats.policy_tracked = reader.u64();
             out.body = result;
             break;
         }

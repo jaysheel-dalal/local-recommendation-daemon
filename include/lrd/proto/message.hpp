@@ -14,12 +14,24 @@ namespace lrd::proto {
 /// Protocol constants. See docs/protocol.md for the byte-level spec.
 inline constexpr std::uint32_t kMagic = 0x4C524431;  // 'L' 'R' 'D' '1'
 
-/// Bumped to 2 in step 9. The v1 message set was a string key-value store; v2
-/// replaces it with item metadata and recommendations. That is not an additive
-/// change - the same type bytes now mean different things - so the version had
-/// to move. A v1 peer talking to a v2 daemon gets UnsupportedVersion, which is
-/// exactly the loud failure the header check exists to produce.
-inline constexpr std::uint8_t kVersion = 2;
+/// Protocol version.
+///
+///   v1 -> v2 (step 9): the message set changed from a string key-value store to
+///      item metadata and recommendations. The same type bytes now mean different
+///      things, so this was never additive.
+///   v2 -> v3 (step 10): five policy counters appended to Stats.
+///
+/// The second bump is the interesting one. Appending fields is *additive under
+/// protobuf* - an older peer ignores what it does not recognise - but binary/v3
+/// rejects trailing bytes by design, so the same change is breaking there. This
+/// is the cost side of the tradeoff docs/benchmarks.md sets out, showing up in
+/// practice rather than in the abstract. Both ends of this system ship together,
+/// so paying it is cheaper than carrying a compatibility shim; a system where
+/// they did not would be feeling this differently.
+///
+/// A peer on the wrong version gets UnsupportedVersion - the loud failure the
+/// header check exists to produce.
+inline constexpr std::uint8_t kVersion = 3;
 
 /// length prefix (4) is *not* counted here; the header is what follows it.
 inline constexpr std::size_t kHeaderSize = 16;
@@ -115,6 +127,16 @@ struct Stats {
     std::uint64_t evictions = 0;
     std::uint64_t entries = 0;
     std::uint64_t capacity = 0;
+
+    // Compliance counters (step 10). Reported separately because they mean
+    // different things operationally: a slate short because items hit their
+    // frequency limit is a tuning question, whereas one short because the policy
+    // store is full is an alarm.
+    std::uint64_t policy_allowed = 0;
+    std::uint64_t policy_exposure_blocked = 0;
+    std::uint64_t policy_frequency_blocked = 0;
+    std::uint64_t policy_store_full = 0;
+    std::uint64_t policy_tracked = 0;
 };
 
 // ---------------------------------------------------------------------------

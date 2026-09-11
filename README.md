@@ -48,8 +48,8 @@ milestone.
 |-----:|-----------|-------|
 | 8 | ProtobufCodec behind the Phase 1 seam, benchmarked | ✅ done |
 | 9 | Item metadata + candidate ranking | ✅ done |
-| 10 | Compliance: exposure cap, frequency limit | ⏳ next |
-| 11 | Client SDK | — |
+| 10 | Compliance: exposure cap, frequency limit | ✅ done |
+| 11 | Client SDK | ⏳ next |
 | 12 | Privacy: noise on exported metrics | — |
 
 Phase 2 (candidate ranking, exposure/frequency policy, client SDK, privacy
@@ -187,6 +187,33 @@ shards the cache (step 7). The alternatives — CLOCK, sampled eviction,
 sharding, lock-free — are each written up with their real costs in
 `docs/concurrency.md`.
 
+**Compliance state is per-item, and that falls out of being on-device.** A
+frequency cap is normally "N shows per *user* per hour", which needs a user
+identifier — exactly what the signal deliberately does not carry. But the daemon
+serves one device, so per-device and per-user are the same scope: the identity is
+implicit in the process boundary rather than stored in a field. The cap works
+without the daemon ever learning who it is capping. A server-side system cannot
+do this.
+
+**Check-and-reserve is one atomic call, not a check then a record.** "Read the
+count, see it is below the cap, increment" is a textbook check-then-act — two
+threads both read `cap-1` and both increment. `reserve()` does both under one
+shard lock, and the API offers no way to split them. Tested with 8 threads × 500
+attempts against a cap of 500, asserting the total allowed is *exactly* 500,
+clean under TSan.
+
+**The policy gate runs during selection, not after it.** Two properties depend on
+that: the slate still *fills* (a capped item is replaced by the next best, rather
+than the response silently shrinking by one), and only items actually returned
+are charged an exposure — not every candidate that was scored. Full reasoning in
+[`docs/policy.md`](docs/policy.md).
+
+**The frequency window is a sliding-window counter**, not a fixed bucket. A fixed
+bucket allows 2× the limit across a boundary — four shows at 10:59 and four more
+at 11:01 all pass. Keeping the previous window's count and weighting it by how
+much is still in view costs O(1) memory and closes that, which is why production
+rate limiters are built this way.
+
 **Ranking is two-stage, because diversity cannot be sorted for.** The penalty for
 repeating a category depends on what has *already been picked*, so it cannot be
 precomputed. Retrieval scores every candidate independently and keeps the best
@@ -284,6 +311,6 @@ src/             implementation, mirroring include/
   client/        client library — becomes the SDK in Phase 2
 bench/           load generator and latency reporter
 tests/           dependency-free harness + CTest entries
-docs/            protocol spec, concurrency write-up, benchmark results
+docs/            protocol spec, concurrency, benchmarks, ranking, policy
 scripts/         build and smoke helpers
 ```

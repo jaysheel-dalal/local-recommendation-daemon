@@ -70,7 +70,7 @@ namespace {
 Server::Server(ServerConfig config)
     : config_(std::move(config)),
       listener_(net::UnixListener::bind(config_.socket_path)),
-      handler_(config_.cache_capacity, config_.cache_shards),
+      handler_(config_.cache_capacity, config_.cache_shards, config_.scoring, config_.policy),
       codec_(proto::make_codec(config_.codec_name)),
       stop_(make_stop_pipe()),
       pool_(config_.thread_count, config_.max_queued_connections) {

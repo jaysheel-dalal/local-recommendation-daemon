@@ -121,7 +121,7 @@ void CandidateSelector::consider(const Item& item) {
     }
 }
 
-std::vector<RankedItem> CandidateSelector::select() {
+std::vector<RankedItem> CandidateSelector::select(const AcceptFn& accept) {
     std::vector<RankedItem> chosen;
     if (count_ == 0 || shortlist_.empty()) {
         return chosen;
@@ -196,10 +196,22 @@ std::vector<RankedItem> CandidateSelector::select() {
         }
 
         const Candidate& winner = shortlist_[best_index];
+
+        // Mark it consumed before consulting `accept`, so a rejection moves on to
+        // the next best rather than reconsidering the same candidate forever.
+        taken[best_index] = true;
+
+        if (accept && !accept(winner.id)) {
+            // Rejected by policy. The slate is not short by one - the loop simply
+            // takes the next best candidate instead.
+            continue;
+        }
+
         chosen.push_back(RankedItem{winner.id, best_adjusted, winner.category, winner.advertiser});
+        // Diversity counts only what was actually returned. Counting a rejected
+        // candidate would penalise its category for a slot it never occupied.
         increment(category_counts, winner.category);
         increment(advertiser_counts, winner.advertiser);
-        taken[best_index] = true;
     }
 
     return chosen;

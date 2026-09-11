@@ -4,6 +4,8 @@
 #include "lrd/concurrency/thread_pool.hpp"
 #include "lrd/daemon/connection_registry.hpp"
 #include "lrd/daemon/handler.hpp"
+#include "lrd/policy/policy.hpp"
+#include "lrd/rank/scorer.hpp"
 #include "lrd/net/unix_socket.hpp"
 #include "lrd/proto/codec.hpp"
 
@@ -37,6 +39,12 @@ struct ServerConfig {
     /// docs/protocol.md. A mismatch fails loudly rather than silently, because
     /// neither format parses the other's bytes.
     std::string codec_name = "binary";
+
+    /// Ranking heuristic tunables. See docs/ranking.md.
+    rank::ScoringConfig scoring;
+
+    /// Compliance limits. See docs/policy.md.
+    policy::PolicyConfig policy;
 
     bool verbose = false;
 };

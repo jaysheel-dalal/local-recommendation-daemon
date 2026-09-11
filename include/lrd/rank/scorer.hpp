@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -121,9 +122,39 @@ public:
     /// are dropped here and never reach the re-ranker.
     void consider(const Item& item);
 
+    /// Decides whether a candidate may actually be taken.
+    ///
+    /// Called at most once per candidate, in descending order of adjusted score,
+    /// and only for candidates the re-ranker is about to select. That ordering
+    /// matters: it is what lets the policy layer *reserve* a slot as a
+    /// side effect and have the reservation be authoritative.
+    using AcceptFn = std::function<bool(ItemId)>;
+
     /// Runs the diversity-aware re-rank and returns up to `count` items, best
     /// first.
-    [[nodiscard]] std::vector<RankedItem> select();
+    ///
+    /// `accept` is consulted before a candidate is taken; returning false skips
+    /// it and the loop moves to the next best. Passing an empty function accepts
+    /// everything.
+    ///
+    /// ## Why the hook is here and not a filter applied afterwards
+    ///
+    /// Step 10 needs a compliance check that both *decides* and *records* - an
+    /// item at its exposure cap must not be returned, and returning it must
+    /// count against that cap. Two properties follow, and neither survives being
+    /// done as a post-filter:
+    ///
+    ///   * **The slate still fills.** Rejecting the third-best candidate lets the
+    ///     fourth take its place, because selection has not finished. A filter
+    ///     applied to a finished list of k would simply return k-1.
+    ///   * **Only what is returned is counted.** The hook runs for the handful of
+    ///     candidates actually chosen, not for every candidate scored, so an item
+    ///     that loses on relevance is not charged an exposure for having been
+    ///     considered.
+    ///
+    /// The cost is one std::function call per selected item - a few per request,
+    /// against a request already costing microseconds.
+    [[nodiscard]] std::vector<RankedItem> select(const AcceptFn& accept = {});
 
     [[nodiscard]] std::size_t considered() const noexcept { return considered_; }
     [[nodiscard]] std::size_t eligible() const noexcept { return eligible_; }

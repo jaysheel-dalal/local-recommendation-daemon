@@ -197,6 +197,11 @@ void ProtobufCodec::encode(const Response& response, ByteBuffer& out) const {
                        stats->set_evictions(result.stats.evictions);
                        stats->set_entries(result.stats.entries);
                        stats->set_capacity(result.stats.capacity);
+                       stats->set_policy_allowed(result.stats.policy_allowed);
+                       stats->set_policy_exposure_blocked(result.stats.policy_exposure_blocked);
+                       stats->set_policy_frequency_blocked(result.stats.policy_frequency_blocked);
+                       stats->set_policy_store_full(result.stats.policy_store_full);
+                       stats->set_policy_tracked(result.stats.policy_tracked);
                    },
                    [&](const RecommendResult& result) {
                        pb::RecommendResponse* out_response =
@@ -338,6 +343,11 @@ DecodeError ProtobufCodec::decode(ByteView body, Response& out) const {
             result.stats.evictions = stats.evictions();
             result.stats.entries = stats.entries();
             result.stats.capacity = stats.capacity();
+            result.stats.policy_allowed = stats.policy_allowed();
+            result.stats.policy_exposure_blocked = stats.policy_exposure_blocked();
+            result.stats.policy_frequency_blocked = stats.policy_frequency_blocked();
+            result.stats.policy_store_full = stats.policy_store_full();
+            result.stats.policy_tracked = stats.policy_tracked();
             out.body = result;
             return DecodeError::None;
         }

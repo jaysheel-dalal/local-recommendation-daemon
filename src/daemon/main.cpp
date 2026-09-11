@@ -16,6 +16,7 @@
 #include "lrd/daemon/server.hpp"
 #include "lrd/proto/codec.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -54,12 +55,31 @@ void print_usage(const char* argv0) {
         "  --shards N      cache shards, power of two (default: %zu)\n"
         "  --threads N     worker threads (default: one per core)\n"
         "  --queue N       connections queued awaiting a worker (default: %zu)\n"
+        "  --exposure-cap N     lifetime shows per item, 0 = unlimited\n"
+        "  --frequency-limit N  shows per item per window, 0 = unlimited\n"
+        "  --frequency-window S window length in seconds (default: 3600)\n"
+        "  --policy-capacity N  items tracked for compliance (default: 100000)\n"
+        "  --policy-fail-open   evict counters when full instead of refusing\n"
         "  --verbose       log every request\n"
         "  --version       print version and exit\n"
         "  --help          print this message and exit\n",
         argv0, static_cast<int>(kDefaultSocketPath.size()), kDefaultSocketPath.data(),
         kDefaultCapacity, static_cast<int>(lrd::proto::available_codecs().size()),
         lrd::proto::available_codecs().data(), kDefaultShards, kDefaultQueue);
+}
+
+/// Parses a count that may legitimately be zero - "0 means unlimited" for the
+/// policy caps. Separate from parse_size, which treats zero as a mistake because
+/// for a thread count or a capacity it is one.
+bool parse_size_allow_zero(const char* text, std::size_t& out, const char* name) {
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    if (end == text || *end != '\0') {
+        std::fprintf(stderr, "lrdd: %s must be a non-negative integer\n", name);
+        return false;
+    }
+    out = static_cast<std::size_t>(value);
+    return true;
 }
 
 bool parse_size(const char* text, std::size_t& out, const char* name) {
@@ -91,6 +111,35 @@ bool parse_args(int argc, char** argv, Options& out) {
             }
         } else if (arg == "--codec" && i + 1 < argc) {
             out.config.codec_name = argv[++i];
+        } else if (arg == "--policy-fail-open") {
+            out.config.policy.fail_open_when_full = true;
+        } else if (arg == "--exposure-cap" && i + 1 < argc) {
+            std::size_t cap = 0;
+            // Zero is a meaningful value here ("unlimited"), so parse_size -
+            // which rejects it - is the wrong tool.
+            if (!parse_size_allow_zero(argv[++i], cap, "--exposure-cap")) {
+                return false;
+            }
+            out.config.policy.exposure_cap = cap;
+        } else if (arg == "--frequency-limit" && i + 1 < argc) {
+            std::size_t limit = 0;
+            if (!parse_size_allow_zero(argv[++i], limit, "--frequency-limit")) {
+                return false;
+            }
+            out.config.policy.frequency_limit = static_cast<std::uint32_t>(limit);
+        } else if (arg == "--frequency-window" && i + 1 < argc) {
+            std::size_t seconds = 0;
+            if (!parse_size(argv[++i], seconds, "--frequency-window")) {
+                return false;
+            }
+            out.config.policy.frequency_window =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::seconds{static_cast<long>(seconds)});
+        } else if (arg == "--policy-capacity" && i + 1 < argc) {
+            if (!parse_size(argv[++i], out.config.policy.max_tracked_items,
+                            "--policy-capacity")) {
+                return false;
+            }
         } else if (arg == "--shards" && i + 1 < argc) {
             if (!parse_size(argv[++i], out.config.cache_shards, "--shards")) {
                 return false;

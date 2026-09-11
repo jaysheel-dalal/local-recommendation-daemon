@@ -76,6 +76,14 @@ message Stats {
   uint64 evictions = 8;
   uint64 entries = 9;
   uint64 capacity = 10;
+
+  // Appended in step 10. Additive here - an older peer ignores them - which is
+  // exactly what forced binary/v2 to become binary/v3 for the same change.
+  uint64 policy_allowed = 11;
+  uint64 policy_exposure_blocked = 12;
+  uint64 policy_frequency_blocked = 13;
+  uint64 policy_store_full = 14;
+  uint64 policy_tracked = 15;
 }
 
 // ---------------------------------------------------------------------------
